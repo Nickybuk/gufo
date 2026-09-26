@@ -56,6 +56,8 @@
 | One-tile-ahead LDS fragment prefetch (dense and routed WMMA) | Rejected: exact output, but the explicit double buffer raised register use (dense 221 → 253 VGPRs; the 128-token pair reached 256 with spills) and every GEMM slowed 3–14%. |
 | hipBLASLt F16 dense projections | Rejected: the pinned library reaches 19–26 TFLOPS on the 2048-token dense shapes against 30–34 TFLOPS for the Q8→F16 WMMA kernels; `tools/qwen-flash/dense_blaslt_sweep.hip` reproduces the sweep. |
 | Side-stream inject/shared-expert overlap | Rejected: exact output and real kernel overlap in the trace, but the co-running kernels slowed each other and interleaved wall-clock runs were 0.5–0.9% slower. |
+| Sparse attention tiles cut across selection windows | Retained; 64-block tiles were cut per 1024-block selection window, so once the budget spread over many windows every tile was partial and only split 0 had work. Tiles now continue across windows and are dealt round-robin; one ratio-4 partial tile carries in LDS (15,776 B, four blocks/CU kept). Unchanged through 4096 tokens; deeper rows reassociate FP32 accumulation within an FP64 limit of 1e-6 (worst 1.2e-7). Attention per call at d128K: 456.5 → 136.1 µs AR, 846.4 → 562.3 µs eight-row verification. ABBA AR tg 25.08 → 26.34 (+5.0%) at d32K and 22.48 → 25.59 (+13.8%) at d128K; d0 output byte-identical. |
+| Whole-tile carry across windows | Rejected: same output, but 16.5 KiB of LDS cost a resident block per CU and slowed d2K eight-row verification 8.5%. |
 
 Separate d32K pp2048 profiling attributes 29.1% of kernel time to MoE, 34.9%
 to dense projections and 12.6% to attention/indexing. Final-tile catch-up
