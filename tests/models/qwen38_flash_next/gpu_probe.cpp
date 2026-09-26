@@ -6,12 +6,16 @@
 // Independent predictor oracle: --mtp-model MTP.gguf --mtp-audit
 // MTP cost calibration: --mtp-model MTP.gguf --cost-audit C (0 = all)
 //                      [--depth N] (default: 0, 4096, 32768)
+// Matched-token decode: --prompt-file P --decode-file C --dump rows.bin
+//                       [--decode-ids ids.bin] (prefill P, then feed C's
+//                       tokens one at a time; one logit row per token)
 #include <algorithm>
 #include <array>
 #include <charconv>
 #include <cmath>
 #include <cstdio>
 #include <fstream>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <string>
@@ -78,6 +82,8 @@ int main(int argc, char** argv) {
   std::string prompt = "The capital of France is";
   std::string dump_path;
   std::string mtp_path;
+  std::string decode_text;
+  std::string decode_ids_path;
   bool mtp_audit = false;
   bool reference = false;
   bool cost_audit = false;
@@ -120,6 +126,13 @@ int main(int argc, char** argv) {
       cost_depth = depth;
     } else if (arg == "--prompt") {
       prompt = next();
+    } else if (arg == "--prompt-file" || arg == "--decode-file") {
+      std::ifstream in(next(), std::ios::binary);
+      std::string text((std::istreambuf_iterator<char>(in)),
+                       std::istreambuf_iterator<char>());
+      (arg == "--prompt-file" ? prompt : decode_text) = std::move(text);
+    } else if (arg == "--decode-ids") {
+      decode_ids_path = next();
     } else if (arg == "--reference") {
       reference = true;
     } else if (arg == "--batch" || arg == "--context") {
@@ -291,6 +304,37 @@ int main(int argc, char** argv) {
       gpu_logits = std::move(out);
       logit_rows = rows;
     }
+  }
+  if (!decode_text.empty()) {
+    // Matched-token decode: feed a fixed continuation one token at a time
+    // through the decode path and dump each step's logits.
+    std::vector<float> row(c.vocab_size);
+    std::size_t steps = 0;
+    std::vector<std::int32_t> fed;
+    for (auto id : tokenizer->Encode(decode_text)) {
+      const auto t = static_cast<std::int32_t>(id);
+      if (tokens.size() + steps + 1 > context)
+        break;
+      if (!executor->Forward(*session, std::span<const std::int32_t>(&t, 1), 1,
+                             row.data(),
+                             q::rocm::Executor::ForwardMode::kDecode, &error)) {
+        std::fprintf(stderr, "decode failed: %s\n", error.c_str());
+        return 1;
+      }
+      if (dump.is_open())
+        dump.write(reinterpret_cast<const char*>(row.data()),
+                   static_cast<std::streamsize>(row.size() * sizeof(float)));
+      fed.push_back(t);
+      ++steps;
+    }
+    if (!decode_ids_path.empty()) {
+      std::ofstream ids(decode_ids_path, std::ios::binary);
+      ids.write(reinterpret_cast<const char*>(fed.data()),
+                static_cast<std::streamsize>(fed.size() * sizeof(fed[0])));
+    }
+    std::printf("decode steps %zu after %zu prompt tokens\n", steps,
+                tokens.size());
+    return dump ? 0 : 1;
   }
   if (dump.is_open()) {
     dump.write(reinterpret_cast<const char*>(gpu_logits.data()),
