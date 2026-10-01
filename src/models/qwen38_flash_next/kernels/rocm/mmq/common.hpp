@@ -179,22 +179,47 @@ struct ggml_hip_unroll<1> {
     }
 };
 
-template<int width = WARP_SIZE>
-static __device__ __forceinline__ int warp_reduce_sum(int x) {
-#pragma unroll
-    for (int offset = width/2; offset > 0; offset >>= 1) {
-        x += __shfl_xor(x, offset, width);
+// Lane i receives lane (i ^ offset)'s value, as __shfl_xor does for a full
+// wave. On gfx1151 this is a DPP row_xmask (offsets below 16) or
+// v_permlanex16 (16): a register move, not a round trip through the LDS
+// crossbar (ds_bpermute). Only the transport differs, so sums stay bitwise.
+template<int offset>
+static __device__ __forceinline__ int xor_lane(int x) {
+#if defined(__gfx1151__)
+    if constexpr (offset < 16) {
+        return __builtin_amdgcn_update_dpp(0, x, 0x160 | offset, 0xF, 0xF, false);
+    } else if constexpr (offset == 16) {
+        return __builtin_amdgcn_permlanex16(x, x, 0x76543210, 0xfedcba98, false, false);
     }
+#endif
+    return __shfl_xor(x, offset, WARP_SIZE);
+}
+
+template<int offset>
+static __device__ __forceinline__ float xor_lane(float x) {
+    return __builtin_bit_cast(float, xor_lane<offset>(__builtin_bit_cast(int, x)));
+}
+
+// The butterfly in the shuffle loop's order (width/2 down to 1).
+template<int width, typename T>
+static __device__ __forceinline__ T xor_reduce_sum(T x) {
+    static_assert(width <= 32, "xor_lane covers offsets up to 16");
+    if constexpr (width >= 32) x += xor_lane<16>(x);
+    if constexpr (width >= 16) x += xor_lane<8>(x);
+    if constexpr (width >= 8) x += xor_lane<4>(x);
+    if constexpr (width >= 4) x += xor_lane<2>(x);
+    if constexpr (width >= 2) x += xor_lane<1>(x);
     return x;
 }
 
 template<int width = WARP_SIZE>
+static __device__ __forceinline__ int warp_reduce_sum(int x) {
+    return xor_reduce_sum<width>(x);
+}
+
+template<int width = WARP_SIZE>
 static __device__ __forceinline__ float warp_reduce_sum(float x) {
-#pragma unroll
-    for (int offset = width/2; offset > 0; offset >>= 1) {
-        x += __shfl_xor(x, offset, width);
-    }
-    return x;
+    return xor_reduce_sum<width>(x);
 }
 
 template<int width = WARP_SIZE>
