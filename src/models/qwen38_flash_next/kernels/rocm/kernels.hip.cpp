@@ -1114,7 +1114,8 @@ __global__ void NarrowKernel(const float* x, T* out, std::size_t count) {
 /// once (four consecutive elements per lane per step) while up to eight
 /// tokens accumulate in registers, then a wave reduction per token.
 constexpr unsigned kSmallGemmRows = 4;
-template<WeightType type, unsigned tokens, bool grouped = false>
+template<WeightType type, unsigned tokens, bool grouped = false,
+         bool kWhole = false>
 __global__ void SmallGemmKernel(const void* w, const float* x, float* out,
                                 std::uint32_t m, std::uint32_t k) {
   if constexpr (grouped) {
@@ -1132,7 +1133,7 @@ __global__ void SmallGemmKernel(const void* w, const float* x, float* out,
   // A lane's steps are loaded kSteps at a time so their reads overlap (one
   // step at a time leaves a decode-sized projection latency-bound); the
   // steps still accumulate one after another, in order.
-  constexpr unsigned kSteps = tokens <= 2 ? 4 : 2;
+  constexpr unsigned kSteps = kWhole || tokens <= 2 ? 4 : 2;
   const std::uint32_t stride = warpSize * 4;
   float acc[tokens] = {};
   for (std::uint32_t i_base = lane * 4; i_base < k; i_base += stride * kSteps) {
@@ -1141,6 +1142,26 @@ __global__ void SmallGemmKernel(const void* w, const float* x, float* out,
 #pragma unroll
     for (unsigned st = 0; st < kSteps; ++st) {
       const std::uint32_t i0 = i_base + st * stride;
+      if constexpr (kWhole) {
+        // F32 rows of whole passes (k a multiple of stride * kSteps): every
+        // step is in range, so the four elements arrive as one 16-byte load.
+        const float4 w4 = reinterpret_cast<const float4*>(
+            static_cast<const void*>(wrow))[i0 / 4];
+        wv[st][0] = w4.x;
+        wv[st][1] = w4.y;
+        wv[st][2] = w4.z;
+        wv[st][3] = w4.w;
+#pragma unroll
+        for (unsigned j = 0; j < tokens; ++j) {
+          const float4 x4 = reinterpret_cast<const float4*>(
+              x + static_cast<std::size_t>(j) * k)[i0 / 4];
+          xv[st][j][0] = x4.x;
+          xv[st][j][1] = x4.y;
+          xv[st][j][2] = x4.z;
+          xv[st][j][3] = x4.w;
+        }
+        continue;
+      }
 #pragma unroll
       for (unsigned r = 0; r < 4; ++r) {
         wv[st][r] = i0 + r < k ? RowElement(wrow, type, i0 + r) : 0.0f;
@@ -1156,11 +1177,23 @@ __global__ void SmallGemmKernel(const void* w, const float* x, float* out,
     }
 #pragma unroll
     for (unsigned st = 0; st < kSteps; ++st) {
-      if (i_base + st * stride >= k) {
+      const std::uint32_t i0 = i_base + st * stride;
+      if (!kWhole && i0 >= k) {
         break;
       }
 #pragma unroll
       for (unsigned j = 0; j < tokens; ++j) {
+        if constexpr (kWhole) {
+          // The bounds-checked path compiles acc + dot to one FMA chain
+          // from acc in element order; spelled out so it cannot reassociate.
+          float a = acc[j];
+#pragma unroll
+          for (unsigned r = 0; r < 4; ++r) {
+            a = __builtin_fmaf(wv[st][r], xv[st][j][r], a);
+          }
+          acc[j] = Materialize(a);
+          continue;
+        }
         float dot = 0.0f;
 #pragma unroll
         for (unsigned r = 0; r < 4; ++r) {
@@ -6194,6 +6227,21 @@ bool DenseF16SsmGemm(const void* w, const __half* x, const float* conv_w,
 template<WeightType type, unsigned tokens>
 void LaunchSmallGemm(const void* w, const float* x, float* out, std::uint32_t m,
                      std::uint32_t k, hipStream_t stream) {
+  if constexpr (type == WeightType::kF32) {
+    // Rows of whole four-step passes (K 2560: router, GDN alpha/beta,
+    // indexer) take the unchecked 16-byte loads, four steps at a time at
+    // any width: the same products in the same order.
+    const bool aligned = (reinterpret_cast<std::uintptr_t>(w) |
+                          reinterpret_cast<std::uintptr_t>(x)) %
+                             16 ==
+                         0;
+    if (aligned && k % (32 * 4 * 4) == 0) {
+      hipLaunchKernelGGL((SmallGemmKernel<type, tokens, false, true>),
+                         dim3((m + kSmallGemmRows - 1) / kSmallGemmRows),
+                         dim3(kSmallGemmRows * 32), 0, stream, w, x, out, m, k);
+      return;
+    }
+  }
   hipLaunchKernelGGL((SmallGemmKernel<type, tokens>),
                      dim3((m + kSmallGemmRows - 1) / kSmallGemmRows),
                      dim3(kSmallGemmRows * 32), 0, stream, w, x, out, m, k);
