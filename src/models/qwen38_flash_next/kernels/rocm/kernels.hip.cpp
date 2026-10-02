@@ -224,6 +224,43 @@ __global__ void RmsNormKernel(const float* x, const float* gamma, float* out,
   }
 }
 
+/// RmsNormKernel for rows of exactly kPer * kThreads elements: every load,
+/// gamma included, is issued before the sum and the scaling pass reuses the
+/// registers. Each thread keeps its elements and its fma chain in the same
+/// order, so the sums and the outputs are bit for bit those of the loop.
+template<unsigned kPer>
+__global__ void RmsNormCachedKernel(const float* x, const float* gamma,
+                                    float* out, std::uint32_t group_dim,
+                                    std::uint32_t groups, float eps) {
+  __shared__ float shared[32];
+  const std::size_t row = blockIdx.x;
+  const float* src = x + row * group_dim;
+  float* dst = out + row * group_dim;
+  const float* g =
+      gamma == nullptr ? nullptr : gamma + (row % groups) * group_dim;
+  float v[kPer];
+  float gv[kPer];
+#pragma unroll
+  for (unsigned j = 0; j < kPer; ++j) {
+    v[j] = src[threadIdx.x + j * kThreads];
+  }
+#pragma unroll
+  for (unsigned j = 0; j < kPer; ++j) {
+    gv[j] = g != nullptr ? g[threadIdx.x + j * kThreads] : 1.0f;
+  }
+  float ss = 0.0f;
+#pragma unroll
+  for (unsigned j = 0; j < kPer; ++j) {
+    ss = Materialize(__builtin_fmaf(v[j], v[j], ss));
+  }
+  ss = BlockSum(ss, shared);
+  const float scale = rsqrtf(ss / static_cast<float>(group_dim) + eps);
+#pragma unroll
+  for (unsigned j = 0; j < kPer; ++j) {
+    dst[threadIdx.x + j * kThreads] = Materialize(v[j] * scale) * gv[j];
+  }
+}
+
 /// grid (tokens, hidden chunks of kThreads): the stream loop stays inside
 /// the thread. With `inject_w` every block also contributes its slice of the
 /// inject dot products, written as partial sums [t][stream][chunk] that
@@ -3052,6 +3089,21 @@ __global__ void MtpHiddenKernel(const float* base, const float* alt,
   }
 }
 
+/// MtpHiddenKernel in 16-byte pieces over grid (tokens, chunks of kThreads).
+__global__ void MtpHiddenVec4Kernel(const float4* base, const float4* alt,
+                                    const std::int32_t* row, float4* dst,
+                                    std::uint32_t width4) {
+  const std::uint32_t t = blockIdx.x;
+  const std::uint32_t i = blockIdx.y * blockDim.x + threadIdx.x;
+  if (i >= width4) {
+    return;
+  }
+  const float4* src =
+      *row < 0 ? alt + static_cast<std::size_t>(t) * width4
+               : base + (static_cast<std::size_t>(*row) + t) * width4;
+  dst[static_cast<std::size_t>(t) * width4 + i] = src[i];
+}
+
 __global__ void MtpAddEmbeddingKernel(const float* embedding, float* residual,
                                       std::uint32_t hidden,
                                       std::uint32_t streams) {
@@ -3060,6 +3112,28 @@ __global__ void MtpAddEmbeddingKernel(const float* embedding, float* residual,
     residual[static_cast<std::size_t>(t) * streams * hidden + i] +=
         embedding[static_cast<std::size_t>(t) * hidden + i % hidden];
   }
+}
+
+/// MtpAddEmbeddingKernel in 16-byte pieces over grid (tokens, chunks of
+/// kThreads): the same one add per element. `hidden4` is hidden / 4.
+__global__ void MtpAddEmbeddingVec4Kernel(const float4* embedding,
+                                          float4* residual,
+                                          std::uint32_t hidden4,
+                                          std::uint32_t streams) {
+  const std::uint32_t t = blockIdx.x;
+  const std::uint32_t i = blockIdx.y * blockDim.x + threadIdx.x;
+  if (i >= streams * hidden4) {
+    return;
+  }
+  const float4 a =
+      embedding[static_cast<std::size_t>(t) * hidden4 + i % hidden4];
+  float4& r = residual[static_cast<std::size_t>(t) * streams * hidden4 + i];
+  float4 v = r;
+  v.x += a.x;
+  v.y += a.y;
+  v.z += a.z;
+  v.w += a.w;
+  r = v;
 }
 
 __device__ __forceinline__ ArgmaxCandidate BetterCandidate(ArgmaxCandidate a,
@@ -4986,8 +5060,22 @@ void RmsNormRows(const float* x, const float* gamma, float* out,
                  float eps, hipStream_t stream) {
   // Every (row, group) pair is one block; the kernel recovers the group
   // from the block index to pick its gamma slice.
+  const std::uint32_t group_dim = dim / groups;
+  // Hidden (2560) and HC (10240) rows: every load in flight before the sum.
+  if (group_dim == 10 * kThreads) {
+    hipLaunchKernelGGL(RmsNormCachedKernel<10>, dim3(n_rows * groups),
+                       dim3(kThreads), 0, stream, x, gamma, out, group_dim,
+                       groups, eps);
+    return;
+  }
+  if (group_dim == 40 * kThreads) {
+    hipLaunchKernelGGL(RmsNormCachedKernel<40>, dim3(n_rows * groups),
+                       dim3(kThreads), 0, stream, x, gamma, out, group_dim,
+                       groups, eps);
+    return;
+  }
   hipLaunchKernelGGL(RmsNormKernel, dim3(n_rows * groups), dim3(kThreads), 0,
-                     stream, x, gamma, out, dim / groups, groups, eps);
+                     stream, x, gamma, out, group_dim, groups, eps);
 }
 
 std::uint32_t HcInjectParts(std::uint32_t hidden) {
@@ -6718,6 +6806,19 @@ void MoeEpilogueVec4F16(const __half* expert_out, const float* weights,
 void MtpHidden(const float* base, const float* alt, const std::int32_t* row,
                float* dst, std::uint32_t n_tokens, std::uint32_t width,
                hipStream_t stream) {
+  const bool aligned = (reinterpret_cast<std::uintptr_t>(base) |
+                        reinterpret_cast<std::uintptr_t>(alt) |
+                        reinterpret_cast<std::uintptr_t>(dst)) %
+                           16 ==
+                       0;
+  if (aligned && width % 4 == 0) {
+    hipLaunchKernelGGL(MtpHiddenVec4Kernel, dim3(n_tokens, Blocks(width / 4)),
+                       dim3(kThreads), 0, stream,
+                       reinterpret_cast<const float4*>(base),
+                       reinterpret_cast<const float4*>(alt), row,
+                       reinterpret_cast<float4*>(dst), width / 4);
+    return;
+  }
   hipLaunchKernelGGL(MtpHiddenKernel, dim3(n_tokens), dim3(kThreads), 0, stream,
                      base, alt, row, dst, width);
 }
@@ -6725,6 +6826,17 @@ void MtpHidden(const float* base, const float* alt, const std::int32_t* row,
 void MtpAddEmbedding(const float* embedding, float* residual,
                      std::uint32_t n_tokens, std::uint32_t hidden,
                      std::uint32_t streams, hipStream_t stream) {
+  const bool aligned = (reinterpret_cast<std::uintptr_t>(embedding) |
+                        reinterpret_cast<std::uintptr_t>(residual)) %
+                           16 ==
+                       0;
+  if (aligned && hidden % 4 == 0) {
+    hipLaunchKernelGGL(
+        MtpAddEmbeddingVec4Kernel, dim3(n_tokens, Blocks(streams * hidden / 4)),
+        dim3(kThreads), 0, stream, reinterpret_cast<const float4*>(embedding),
+        reinterpret_cast<float4*>(residual), hidden / 4, streams);
+    return;
+  }
   hipLaunchKernelGGL(MtpAddEmbeddingKernel, dim3(n_tokens), dim3(kThreads), 0,
                      stream, embedding, residual, hidden, streams);
 }
