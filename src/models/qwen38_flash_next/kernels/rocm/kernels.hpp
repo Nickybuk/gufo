@@ -390,12 +390,15 @@ void PoolIndexerBlocks(const float* raw_keys, const float* gamma,
 /// b visible). Every block is visible when the count fits the budget.
 /// Queries retain F32 precision; pooled cache keys are F16. Scores
 /// still accumulate in FP32. `scores` holds n_tokens * max_blocks floats.
+/// `live_blocks`, when nonzero, bounds the complete blocks of the last
+/// query (eager launches only: a captured graph must cover max_blocks).
 void SelectBlocks(const float* q, const __half* blocks, std::uint32_t* mask,
                   float* scores, std::uint32_t n_tokens,
                   const std::uint32_t* start_pos, std::uint32_t first_token,
                   std::uint32_t heads, std::uint32_t dim, std::uint32_t ratio,
                   std::uint32_t budget, std::uint32_t mask_words,
-                  std::uint32_t max_blocks, hipStream_t stream);
+                  std::uint32_t max_blocks, hipStream_t stream,
+                  std::uint32_t live_blocks = 0);
 
 /// Per-token attention (decode and narrow batches). With `partials`
 /// (n_tokens * heads * splits * (d + 2) floats) the key tiles are split

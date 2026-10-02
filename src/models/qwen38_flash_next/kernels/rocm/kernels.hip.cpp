@@ -5828,13 +5828,17 @@ void SelectBlocks(const float* q, const __half* blocks, std::uint32_t* mask,
                   const std::uint32_t* start_pos, std::uint32_t first_token,
                   std::uint32_t heads, std::uint32_t dim, std::uint32_t ratio,
                   std::uint32_t budget, std::uint32_t mask_words,
-                  std::uint32_t max_blocks, hipStream_t stream) {
+                  std::uint32_t max_blocks, hipStream_t stream,
+                  std::uint32_t live_blocks) {
   if (heads != kSelectHeads || dim != kSelectDim) {
     return;
   }
-  // Grids are sized by max_blocks so a captured decode graph replays at any
-  // position; blocks past the live range return at once.
-  const dim3 grid(n_tokens, (max_blocks + kThreads - 1) / kThreads);
+  // Graph grids are sized by max_blocks so a captured decode graph replays
+  // at any position; blocks past the live range return at once. An eager
+  // launch passes its live range, sparing the empty workgroups.
+  const std::uint32_t grid_blocks =
+      live_blocks != 0 ? std::min(live_blocks, max_blocks) : max_blocks;
+  const dim3 grid(n_tokens, (grid_blocks + kThreads - 1) / kThreads);
   hipLaunchKernelGGL(SelectScoreKernel, grid, dim3(kThreads), 0, stream, q,
                      blocks, scores, n_tokens, start_pos, first_token, ratio,
                      budget, max_blocks);
