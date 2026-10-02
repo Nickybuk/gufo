@@ -2114,36 +2114,46 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
              "partial attention output initialization", error_msg)) {
     return false;
   }
+  // Queries before the token budget always take the dense tiles, also in a
+  // batch that crosses it, so each position's key sweep (and its rounding)
+  // does not depend on where the prefill chunks fall. The sparse part goes
+  // first: it is the launch that can be refused.
+  const auto attend = [&](std::uint32_t first, std::uint32_t rows, bool last) {
+    const std::uint32_t pos = start_pos + first;
+    const std::uint32_t dense_rows =
+        mask != nullptr && !last && pos < c.indexer_top_k
+            ? std::min(rows, c.indexer_top_k - pos)
+            : 0;
+    const auto at = [&](std::uint32_t row) {
+      return std::size_t{first + row} * c.AttentionQDim();
+    };
+    return (dense_rows == rows ||
+            WmmaCausalAttention(
+                s_.q + at(dense_rows), s_.attn_gate + at(dense_rows), s.k_cache,
+                s.v_cache,
+                mask ? mask + std::size_t{first + dense_rows} * mask_words_
+                     : nullptr,
+                mask_words_, s_.ctx + at(dense_rows), rows - dense_rows,
+                pos + dense_rows, c.num_heads, c.num_kv_heads, c.head_dim,
+                c.compress_ratio, stream_, last)) &&
+           (dense_rows == 0 ||
+            WmmaCausalAttention(s_.q + at(0), s_.attn_gate + at(0), s.k_cache,
+                                s.v_cache, nullptr, mask_words_, s_.ctx + at(0),
+                                dense_rows, pos, c.num_heads, c.num_kv_heads,
+                                c.head_dim, c.compress_ratio, stream_, false));
+  };
   if (checkpoint_tokens != 0 && checkpoint_tokens < n_tokens) {
     // Sparse tiles compact the union of their queries' selected keys.
     // Keep the checkpoint's query grouping identical to a pass ending there.
-    const auto prefix_sparse =
-        c.compress_ratio > 0 && start_pos + checkpoint_tokens > c.indexer_top_k;
-    const auto tail = n_tokens - checkpoint_tokens;
-    const auto offset = std::size_t{checkpoint_tokens} * c.AttentionQDim();
-    if (!WmmaCausalAttention(s_.q, s_.attn_gate, s.k_cache, s.v_cache,
-                             prefix_sparse ? mask : nullptr, mask_words_,
-                             s_.ctx, checkpoint_tokens, start_pos, c.num_heads,
-                             c.num_kv_heads, c.head_dim, c.compress_ratio,
-                             stream_) ||
-        !WmmaCausalAttention(
-            s_.q + offset, s_.attn_gate + offset, s.k_cache, s.v_cache,
-            mask ? mask + std::size_t{checkpoint_tokens} * mask_words_
-                 : nullptr,
-            mask_words_, s_.ctx + offset, tail, start_pos + checkpoint_tokens,
-            c.num_heads, c.num_kv_heads, c.head_dim, c.compress_ratio,
-            stream_)) {
+    if (!attend(0, checkpoint_tokens, false) ||
+        !attend(checkpoint_tokens, n_tokens - checkpoint_tokens, false)) {
       AssignError(error_msg, "checkpoint attention geometry is unsupported");
       return false;
     }
     return !project_output ||
            Dense(l.attn_out, s_.ctx, out, n_tokens, error_msg);
   }
-  if (MatrixRows(n_tokens) &&
-      WmmaCausalAttention(s_.q, s_.attn_gate, s.k_cache, s.v_cache, mask,
-                          mask_words_, s_.ctx, n_tokens, start_pos, c.num_heads,
-                          c.num_kv_heads, c.head_dim, c.compress_ratio, stream_,
-                          last_only)) {
+  if (MatrixRows(n_tokens) && attend(0, n_tokens, last_only)) {
     return !project_output ||
            Dense(l.attn_out, s_.ctx, out, n_tokens, error_msg);
   }
