@@ -2784,6 +2784,16 @@ inline unsigned Blocks(std::size_t count) {
   return static_cast<unsigned>((count + kThreads - 1) / kThreads);
 }
 
+// A barrier for kernels whose waves exchange data through LDS only.
+// __syncthreads also waits for every outstanding global load and drops the
+// L0 cache, which serializes register prefetches behind the barrier. The
+// global inputs are read-only here, so completing LDS traffic is enough.
+__device__ __forceinline__ __attribute__((convergent)) void SyncLds() {
+  asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+  __builtin_amdgcn_s_barrier();
+  asm volatile("" ::: "memory");
+}
+
 // Masked prefill attention on the WMMA matrix cores, ported from the Qwen
 // 27B route (src/models/qwen/hip/kernels/attention_wmma.hip) to this
 // model's 24 x 256 query heads over two KV heads. Wave32 fragment layout: A
@@ -3125,7 +3135,7 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
 
   while (cur.count != 0) {
     // --- stage K from the registers the previous iteration prefetched
-    __syncthreads();
+    SyncLds();
 #pragma unroll
     for (std::uint32_t n = 0; n < kKRegs; ++n) {
       const std::uint32_t idx = tid + (n * 256);
@@ -3134,7 +3144,7 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
       *reinterpret_cast<uint4*>(&kv_lds[(key_row * kWmmaKStride) + d8]) =
           k_cur[n];
     }
-    __syncthreads();
+    SyncLds();
 
     // --- prefetch the next tile. Everything below covers its latency.
     cursor = gather_tile(cursor, pre);
@@ -3160,7 +3170,7 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
         s_lds[s_kh][s_tile][(2 * i) + half_id][sub] = s_acc[i];
       }
     }
-    __syncthreads();
+    SyncLds();
 
     // QK has finished reading K. V and softmax P use separate LDS, so
     // their writes can share the barrier at the end of softmax.
@@ -3241,7 +3251,7 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
         }
       }
     }
-    __syncthreads();
+    SyncLds();
 
     // --- rescale the running O by the new maximum. A lane touches only rows
     // 2i + half_id, so the factors are read once per row block.
@@ -3323,7 +3333,7 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
   }
   if (tid < kRows * kSoftmaxLanes && tid % kSoftmaxLanes == 0)
     row_sum[tid / kSoftmaxLanes] = running_sum;
-  __syncthreads();
+  SyncLds();
 
   // --- epilogue: normalize and apply the sigmoid output gate ---
 #pragma unroll
