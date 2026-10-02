@@ -5110,7 +5110,7 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
 
   if constexpr (kAttention) {
     static_assert(BM == 256 && BN == 128 && BK == 2 && WM == 8 && WN == 1);
-    static_assert(!kHcMix && !kSsmConv && kRowGroup == 1);
+    static_assert(!kHcMix && !kSsmConv);
     constexpr unsigned stride = 36, dim = 256, width = 6144, kvwidth = 512;
     float* scratch = reinterpret_cast<float*>(s_lds);
     float* tile = scratch + wave_id * 16 * stride;
@@ -5334,7 +5334,7 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
         if constexpr (kSsmConv) {
           static_assert(BM == 256 && BN == 128 && BK == 2 && WM == 8 &&
                         WN == 1);
-          static_assert(!kHcMix && kRowGroup == 1);
+          static_assert(!kHcMix);
           constexpr std::uint32_t channels = 10240;
           if (tok < batch) {
 #pragma unroll
@@ -5410,8 +5410,11 @@ bool AttentionF16Gemm(const void* weights, const __half* input,
     return false;
   const AttentionProjectionOutput output{q_gamma, k_gamma,  query, gate, keys,
                                          values,  position, theta, eps,  rope};
+  // One 256-row tile per query, gate, key or value head (52). Four row
+  // tiles per token tile in launch order share each activation tile's read
+  // (8.8 to 7.9 ms at 4,096 tokens).
   hipLaunchKernelGGL(
-      (DenseF16GEMMKernel<256, 128, 2, 8, 1, 1, false, false, true>),
+      (DenseF16GEMMKernel<256, 128, 2, 8, 1, 4, false, false, true>),
       dim3((n_tokens + 127) / 128, 52), dim3(kThreads), 0, stream, weights,
       input, nullptr, n_tokens, 13312, 2560, nullptr, nullptr, nullptr, nullptr,
       nullptr, output);
@@ -5478,11 +5481,22 @@ bool DenseF16Gemm(const void* w, const __half* x, float* out, std::size_t batch,
     if (m == 10240 && k == 320 && batch >= 1024) {
       hipLaunchKernelGGL((DenseF16GEMMKernel<kWideBM, kBN, 1, 4, 2, 8>), grid,
                          dim3(kThreads), 0, stream, w, x, out, batch, m, k);
-    } else if (batch >= 1024 && (((m == 16384 || m == 13312) && k == 2560) ||
-                                 (m == 2560 && k == 6144))) {
+    } else if (batch >= 1024 && m == 2560 && k == 6144) {
+      // The output projection's activation is 50 MB at 4,096 tokens. In
+      // grid order the resident blocks each walk a different token tile of
+      // it; walking five row tiles of a token tile first shares each
+      // activation tile between them (5.7 to 3.4 ms). Only the launch order
+      // changes.
+      hipLaunchKernelGGL((DenseF16GEMMKernel<kWideBM, kBN, 2, 8, 1, 5>), grid,
+                         dim3(kThreads), 0, stream, w, x, out, batch, m, k);
+    } else if (batch >= 1024 && (m == 16384 || m == 13312) && k == 2560) {
       // Eight row groups reuse each weight fragment across all token tiles
       // and keep fewer weight fragments live. K accumulation is unchanged.
       hipLaunchKernelGGL((DenseF16GEMMKernel<kWideBM, kBN, 2, 8, 1>), grid,
+                         dim3(kThreads), 0, stream, w, x, out, batch, m, k);
+    } else if (batch >= 1024 && m == 2560) {
+      // Shared-expert down: pairs of row tiles per token tile (-11 %).
+      hipLaunchKernelGGL((DenseF16GEMMKernel<kWideBM, kBN, 1, 4, 2, 2>), grid,
                          dim3(kThreads), 0, stream, w, x, out, batch, m, k);
     } else {
       hipLaunchKernelGGL((DenseF16GEMMKernel<kWideBM, kBN, 1, 4, 2>), grid,
@@ -5507,7 +5521,8 @@ bool DenseF16SsmGemm(const void* w, const __half* x, const float* conv_w,
       kernel != kSsmConvTaps) {
     return false;
   }
-  hipLaunchKernelGGL((DenseF16GEMMKernel<256, 128, 2, 8, 1, 1, false, true>),
+  // Row-tile pairs per token tile in launch order (-0.9 %).
+  hipLaunchKernelGGL((DenseF16GEMMKernel<256, 128, 2, 8, 1, 2, false, true>),
                      dim3((n_tokens + 127) / 128, m / 256), dim3(kThreads), 0,
                      stream, w, x, qkvz, n_tokens, m, k, nullptr, nullptr,
                      nullptr, conv_w, convolved);
