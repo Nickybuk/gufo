@@ -278,9 +278,15 @@ static __global__ void group_moe_slots(const int32_t* ids, int32_t* groups,
                                        bool split) {
   const int anchors = tokens * experts_used;
   const int anchor = threadIdx.x;
+  // The scans below read the routing from LDS, not one dependent global
+  // load per step.
+  __shared__ int32_t routed[kMoeGroupAnchors];
+  if (anchor < anchors)
+    routed[anchor] = ids[anchor];
+  __syncthreads();
   int list = -1;
   if (anchor < anchors) {
-    const int expert = ids[anchor];
+    const int expert = routed[anchor];
     int32_t* group = groups + anchor * (tokens + 1);
     group[0] = -1;
     if (expert < 0) {
@@ -288,15 +294,16 @@ static __global__ void group_moe_slots(const int32_t* ids, int32_t* groups,
       list = 0;
     } else {
       bool leader = true;
-      for (int i = 0; i < anchor && leader; ++i)
-        leader = ids[i] != expert;
+#pragma unroll 8
+      for (int i = 0; i < anchor; ++i)
+        leader &= routed[i] != expert;
       if (leader) {
         group[0] = expert;
         int active = 0;
         for (int t = 0; t < tokens; ++t) {
           uint32_t slots = 0;
           for (int j = 0; j < experts_used; ++j)
-            if (ids[t * experts_used + j] == expert)
+            if (routed[t * experts_used + j] == expert)
               slots |= uint32_t{1} << j;
           group[t + 1] = static_cast<int32_t>(slots);
           active += slots != 0;
@@ -305,23 +312,34 @@ static __global__ void group_moe_slots(const int32_t* ids, int32_t* groups,
       }
     }
   }
-  __shared__ int lists_of[kMoeGroupAnchors];
-  lists_of[anchor] = list;
+  // Each list keeps its anchors in ascending order: a rank is the members
+  // in lower lanes of this wave plus the members of lower waves.
+  __shared__ int wave_counts[2][kMoeGroupAnchors / 32];
+  const int lane = anchor % 32;
+  const int wave = anchor / 32;
+  const uint32_t member[2] = {static_cast<uint32_t>(__ballot(list == 0)),
+                              static_cast<uint32_t>(__ballot(list == 1))};
+  if (lane == 0) {
+    wave_counts[0][wave] = __popc(member[0]);
+    wave_counts[1][wave] = __popc(member[1]);
+  }
   __syncthreads();
   int32_t* lists = groups + anchors * (tokens + 1);
+  const int waves = blockDim.x / 32;
   if (anchor == 0) {
     int counts[2] = {};
-    for (int i = 0; i < anchors; ++i)
-      if (lists_of[i] >= 0)
-        ++counts[lists_of[i]];
+    for (int w = 0; w < waves; ++w) {
+      counts[0] += wave_counts[0][w];
+      counts[1] += wave_counts[1][w];
+    }
     lists[0] = counts[0];
     lists[anchors + 1] = counts[1];
   }
   if (list < 0)
     return;
-  int rank = 0;
-  for (int i = 0; i < anchor; ++i)
-    rank += lists_of[i] == list;
+  int rank = __popc(member[list] & ((uint32_t{1} << lane) - 1));
+  for (int w = 0; w < wave; ++w)
+    rank += wave_counts[list][w];
   lists[list * (anchors + 1) + 1 + rank] = anchor;
 }
 
