@@ -187,6 +187,12 @@ bool UnquantizedF16Gemm(const void* w, const __half* x, float* out,
                         hipStream_t stream);
 bool DenseF16Gemm(const void* w, const __half* x, float* out, std::size_t batch,
                   std::size_t m, std::size_t k, hipStream_t stream);
+/// BF16 weight rows [m][k] times BF16 activation rows [batch][k] with one
+/// F32 K16 chain per output. Token t's chain starts ((t / 32) % 4) * 128
+/// elements into K and wraps: hipBLASLt's MT32x32x64 order (BlasLt::Gemm).
+/// out is [batch][m].
+bool DenseBf16Gemm(const void* w, const void* x, float* out, std::size_t batch,
+                   std::size_t m, std::size_t k, hipStream_t stream);
 
 /// SSM Q8_0 projection fused with its four-tap convolution. Supports
 /// [m=16384,k=2560,channels=10240] and at least 1024 tokens. qkvz retains

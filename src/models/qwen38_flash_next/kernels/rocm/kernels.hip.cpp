@@ -1867,6 +1867,14 @@ __device__ __forceinline__ v8f Wmma(v16h a, v16h b, v8f c) {
   return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
 }
 
+// BF16 fragments carry the same sixteen 16-bit lanes.
+using v16bf = __attribute__((ext_vector_type(16))) __bf16;
+
+__device__ __forceinline__ v8f WmmaBf16(v16h a, v16h b, v8f c) {
+  return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(
+      __builtin_bit_cast(v16bf, a), __builtin_bit_cast(v16bf, b), c);
+}
+
 // Keep indexer queries in F32: narrowing them before ranking can swap blocks
 // at the selection boundary. A thread scores one key, reusing it across all
 // four heads. Preserve the original wave32 F32 accumulation and reduction
@@ -4905,7 +4913,7 @@ struct AttentionProjectionOutput {
 /// and use the same ordered K16 products. y is [batch][m].
 template<int BM, int BN, int BK, int WM, int WN, int kRowGroup = 1,
          bool kHcMix = false, bool kSsmConv = false, bool kAttention = false,
-         bool kHalfWeights = false>
+         bool kHalfWeights = false, bool kBf16 = false>
 __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
     const void* __restrict__ w, const __half* __restrict__ x,
     float* __restrict__ y, std::size_t batch, std::size_t m, std::size_t k,
@@ -4914,6 +4922,10 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
     float* conv_out = nullptr, AttentionProjectionOutput attention = {}) {
   static_assert(WM * WN == 8, "256 threads is 8 waves");
   static_assert(BM % (16 * WM) == 0 && BN % (16 * WN) == 0);
+  static_assert(!(kBf16 && kHalfWeights));
+  // 16-bit weight rows staged as they are: F16, or BF16 with BF16
+  // activations.
+  constexpr bool kRawWeights = kHalfWeights || kBf16;
   constexpr int kRowTiles = BM / 16;
   constexpr int kTokTiles = BN / 16;
   constexpr int kWaveRowTiles = kRowTiles / WM;
@@ -4955,6 +4967,25 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
   const unsigned within = (blockIdx.y % kRowGroup) * gridDim.x + blockIdx.x;
   const int r_block = (row_group * kRowGroup + within % kRowGroup) * BM;
   const int t_block = (within / kRowGroup) * BN;
+  // BF16 replaces a library GEMM whose 32-token tile g starts its K loop
+  // (g % 4) * 4 blocks in and wraps. A block takes the four tiles of one
+  // rotation class, one per token wave, so every dot product keeps the
+  // library's order.
+  const int bf16_class = kBf16 ? static_cast<int>(blockIdx.x % 4) : 0;
+  const int k_rotation = kBf16 ? (bf16_class * 4) % num_kb : 0;
+  const auto token_of = [&](int local) {
+    if constexpr (kBf16) {
+      static_assert(BN == 128 && WN == 4 && kRowGroup == 1);
+      return (static_cast<int>(blockIdx.x / 4) * 512) + (bf16_class * 32) +
+             ((local / 32) * 128) + (local % 32);
+    } else {
+      return t_block + local;
+    }
+  };
+  const auto rotate = [&](int kb) {
+    const int r = kb + k_rotation;
+    return r >= num_kb ? r - num_kb : r;
+  };
 
   // Weight fetch unit p of a thread: row (p * 256 + tid) / BK, K block
   // (p * 256 + tid) % BK of the stage; rows past m read the last row with
@@ -4971,19 +5002,19 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
     const int weight_row = kHcMix ? (r % 4) * (m_i / 4) + r / 4 : r;
     a_ptr[p] = w_bytes +
                static_cast<std::size_t>(a_live[p] ? weight_row : (m_i - 1)) *
-                   static_cast<std::size_t>(num_kb) * (kHalfWeights ? 64 : 34);
+                   static_cast<std::size_t>(num_kb) * (kRawWeights ? 64 : 34);
   }
   const __half* b_ptr[kBPer];
 #pragma unroll
   for (int p = 0; p < kBPer; ++p) {
     const int idx = (p * 256) + tid;
-    const int t = t_block + (idx / BK);
+    const int t = token_of(idx / BK);
     b_ptr[p] = idx < kBUnits && t < static_cast<int>(batch)
                    ? x + (static_cast<std::size_t>(t) * k)
                    : nullptr;
   }
   uint4 a_codes[kAPer][2];
-  uint4 a_half[kHalfWeights ? kAPer : 1][4];
+  uint4 a_half[kRawWeights ? kAPer : 1][4];
   std::uint32_t a_d[kAPer];
   uint4 b_data[kBPer][4];
 
@@ -4992,9 +5023,9 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
     for (int p = 0; p < kAPer; ++p) {
       const int kb = kb0 + (((p * 256) + tid) % BK);
       const bool live = a_live[p] && kb < num_kb;
-      if constexpr (kHalfWeights) {
+      if constexpr (kRawWeights) {
         const auto* src = reinterpret_cast<const uint4*>(
-            a_ptr[p] + static_cast<std::size_t>(kb) * 64);
+            a_ptr[p] + static_cast<std::size_t>(rotate(kb)) * 64);
 #pragma unroll
         for (int c = 0; c < 4; ++c)
           a_half[p][c] = live ? src[c] : make_uint4(0u, 0u, 0u, 0u);
@@ -5011,7 +5042,8 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
     for (int p = 0; p < kBPer; ++p) {
       const int kb = kb0 + (((p * 256) + tid) % BK);
       if (b_ptr[p] != nullptr && kb < num_kb) {
-        const auto* src = reinterpret_cast<const uint4*>(b_ptr[p] + (kb * 32));
+        const auto* src =
+            reinterpret_cast<const uint4*>(b_ptr[p] + (rotate(kb) * 32));
 #pragma unroll
         for (int c = 0; c < 4; ++c) {
           b_data[p][c] = src[c];
@@ -5036,7 +5068,7 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
       }
       const int row = idx / BK;
       const int kk = idx % BK;
-      if constexpr (kHalfWeights) {
+      if constexpr (kRawWeights) {
 #pragma unroll
         for (int c = 0; c < 4; ++c)
           s_a[kk][row][swizzle(row, c)] = a_half[p][c];
@@ -5130,11 +5162,17 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
         __builtin_memcpy(&b_hi, &c[2], 32);
 #pragma unroll
         for (int i = 0; i < kWaveRowTiles; ++i) {
-          acc[i][j] = Wmma(a_lo[i], b_lo, acc[i][j]);
-          if constexpr (kHalfWeights)
+          if constexpr (kBf16) {
+            // One K16 chain in K order, as the library GEMM it replaces.
+            acc[i][j] = WmmaBf16(a_lo[i], b_lo, acc[i][j]);
+            acc[i][j] = WmmaBf16(a_hi[i], b_hi, acc[i][j]);
+          } else if constexpr (kHalfWeights) {
+            acc[i][j] = Wmma(a_lo[i], b_lo, acc[i][j]);
             acc_high[i][j] = Wmma(a_hi[i], b_hi, acc_high[i][j]);
-          else
+          } else {
+            acc[i][j] = Wmma(a_lo[i], b_lo, acc[i][j]);
             acc[i][j] = Wmma(a_hi[i], b_hi, acc[i][j]);
+          }
         }
       }
     }
@@ -5362,9 +5400,8 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
       const std::size_t r0 =
           static_cast<std::size_t>(r_block) +
           static_cast<std::size_t>((((wave_row * kWaveRowTiles) + i) * 16));
-      const std::size_t t0 =
-          static_cast<std::size_t>(t_block) +
-          static_cast<std::size_t>((((wave_tok * kWaveTokTiles) + j) * 16));
+      const std::size_t t0 = static_cast<std::size_t>(
+          token_of(((wave_tok * kWaveTokTiles) + j) * 16));
 #pragma unroll
       for (unsigned group = 0; group < kOutputGroups; ++group) {
         // Lane pair (2p, 2p + 1) stores token p's 32 rows as eight float4.
@@ -5497,6 +5534,19 @@ bool UnquantizedF16Gemm(const void* w, const __half* x, float* out,
       (DenseF16GEMMKernel<64, 64, 2, 2, 4, 1, false, false, false, true>),
       dim3((batch + 63) / 64, (m + 63) / 64), dim3(kThreads), 0, stream, w, x,
       out, batch, m, k);
+  return true;
+}
+
+bool DenseBf16Gemm(const void* w, const void* x, float* out, std::size_t batch,
+                   std::size_t m, std::size_t k, hipStream_t stream) {
+  if (m == 0 || batch == 0 || k == 0 || k % 32 != 0)
+    return false;
+  // Four blocks, one per K rotation class, cover each 512 tokens.
+  hipLaunchKernelGGL(
+      (DenseF16GEMMKernel<64, 128, 2, 2, 4, 1, false, false, false, false,
+                          true>),
+      dim3(((batch + 511) / 512) * 4, (m + 63) / 64), dim3(kThreads), 0,
+      stream, w, static_cast<const __half*>(x), out, batch, m, k);
   return true;
 }
 

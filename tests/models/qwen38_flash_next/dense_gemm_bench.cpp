@@ -21,6 +21,7 @@
 #include <string>
 #include <vector>
 
+#include "src/models/qwen38_flash_next/kernels/rocm/blaslt.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 
 namespace {
@@ -249,6 +250,89 @@ int main(int argc, char** argv) try {
                     static_cast<void*>(gate), static_cast<void*>(keys),
                     static_cast<void*>(values)})
       CheckHip(hipFree(p), "hipFree");
+  }
+
+  // BF16 indexer projections (query 512 x 2560, key 128 x 2560, and a TP2
+  // rank's halves): the library kernel against BlasLt::Gemm, which runs
+  // DenseBf16Gemm where that reproduces the library. Timed at the requested
+  // tokens; every token count up to it must match bitwise.
+  {
+    std::string error;
+    auto blas = q::BlasLt::Create(nullptr, &error);
+    if (!blas)
+      throw std::runtime_error(error);
+    constexpr int k = 2560;
+    const auto bf16 = [](std::size_t count, std::uint32_t seed, float scale) {
+      std::vector<std::uint16_t> v(count);
+      for (auto& e : v) {
+        const float f = scale *
+                        static_cast<float>(static_cast<int>(Next(&seed) % 2001) -
+                                           1000) /
+                        1000.0F;
+        std::uint32_t bits = 0;
+        std::memcpy(&bits, &f, 4);
+        e = static_cast<std::uint16_t>((bits + 0x7FFFU + ((bits >> 16) & 1U)) >>
+                                       16);
+      }
+      return v;
+    };
+    const auto host = [](const float* d, std::size_t count) {
+      std::vector<float> h(count);
+      CheckHip(hipMemcpy(h.data(), d, count * 4, hipMemcpyDeviceToHost),
+               "hipMemcpy");
+      return h;
+    };
+    for (const int m : {512, 128, 256, 64}) {
+      auto* w = Upload(bf16(std::size_t{512} * k, 51U + m, 0.05F));
+      auto* x = Upload(bf16(std::size_t{tokens} * k, 52U, 3.0F));
+      const std::size_t bytes = std::size_t{tokens} * m * sizeof(float);
+      auto* y_lib = static_cast<float*>(Zeros(bytes));
+      auto* y_own = static_cast<float*>(Zeros(bytes));
+      const auto lib = [&](int n) {
+        if (!blas->LibraryGemm(w, x, y_lib, HIP_R_16BF, m, n, k, &error))
+          throw std::runtime_error(error);
+      };
+      const auto own = [&](int n) {
+        if (!blas->Gemm(w, x, y_own, HIP_R_16BF, m, n, k, &error))
+          throw std::runtime_error(error);
+      };
+      const int t = static_cast<int>(tokens);
+      char name[16];
+      std::snprintf(name, sizeof(name), "bf%d", m);
+      std::printf("%s-lib", name);
+      report("", MedianMs([&] { lib(t); }, reps), 2.0 * tokens * m * k,
+             Hash(y_lib, bytes));
+      std::printf("%s-own", name);
+      report("", MedianMs([&] { own(t); }, reps), 2.0 * tokens * m * k,
+             Hash(y_own, bytes));
+      int routed = 0;
+      int differ = 0;
+      std::string library_only;
+      for (int n = 1; n <= t; ++n) {
+        const bool uses_own = blas->UsesOwnKernel(HIP_R_16BF, m, n, k, &error);
+        routed += uses_own;
+        if (!uses_own) {
+          if (library_only.size() < 200)
+            library_only += " " + std::to_string(n);
+          continue;
+        }
+        lib(n);
+        own(n);
+        CheckHip(hipDeviceSynchronize(), "hipDeviceSynchronize");
+        const auto a = host(y_lib, std::size_t{static_cast<unsigned>(n)} * m);
+        const auto b = host(y_own, std::size_t{static_cast<unsigned>(n)} * m);
+        if (std::memcmp(a.data(), b.data(), a.size() * 4) != 0) {
+          if (++differ <= 10)
+            std::printf("%s n %d DIFF\n", name, n);
+        }
+      }
+      std::printf("%s n 1..%d: own kernel at %d, bitwise differ at %d; "
+                  "library only at:%s\n",
+                  name, t, routed, differ, library_only.c_str());
+      for (void* p : {static_cast<void*>(w), static_cast<void*>(x),
+                      static_cast<void*>(y_lib), static_cast<void*>(y_own)})
+        CheckHip(hipFree(p), "hipFree");
+    }
   }
   return 0;
 } catch (const std::exception& e) {
