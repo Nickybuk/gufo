@@ -817,9 +817,10 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1(
 }
 
 // The 6-bit scale and min of sub-blocks 2j and 2j + 1 (j in 0..3) of a Q4_K
-// block. The twelve scale bytes are read as three words by every lane: a
-// branch on j sent half of each wave's lanes into their own scale loads.
-// The 16-bit scale words selected and their masks are the usual ones.
+// block. The twelve scale bytes are read as three words by every lane, and
+// both packings are formed before a select: with a branch on j, the third
+// word's load was sunk into the j >= 2 side, whose wait then covered every
+// load the wave had in flight. The 16-bit words and masks are the usual ones.
 static __device__ __forceinline__ void q4_K_scale_pair(
     const block_q4_K * __restrict__ b, const int j, uint16_t * __restrict__ aux) {
     const uint32_t * words = (const uint32_t *)b->scales;
@@ -827,13 +828,12 @@ static __device__ __forceinline__ void q4_K_scale_pair(
     const uint32_t lo  = (words[0] >> shift) & 0xffff; // scales[j % 2]
     const uint32_t mid = (words[1] >> shift) & 0xffff; // scales[j % 2 + 2]
     const uint32_t hi  = (words[2] >> shift) & 0xffff; // scales[j % 2 + 4]
-    if (j < 2) {
-        aux[0] = lo  & 0x3f3f;
-        aux[1] = mid & 0x3f3f;
-    } else {
-        aux[0] = ((hi >> 0) & 0x0f0f) | ((lo  & 0xc0c0) >> 2);
-        aux[1] = ((hi >> 4) & 0x0f0f) | ((mid & 0xc0c0) >> 2);
-    }
+    const uint32_t low0  = lo  & 0x3f3f;
+    const uint32_t low1  = mid & 0x3f3f;
+    const uint32_t high0 = ((hi >> 0) & 0x0f0f) | ((lo  & 0xc0c0) >> 2);
+    const uint32_t high1 = ((hi >> 4) & 0x0f0f) | ((mid & 0xc0c0) >> 2);
+    aux[0] = j < 2 ? low0 : high0;
+    aux[1] = j < 2 ? low1 : high1;
 }
 
 static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
