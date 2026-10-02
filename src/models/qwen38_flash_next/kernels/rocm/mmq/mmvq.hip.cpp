@@ -55,6 +55,66 @@ __launch_bounds__(32 * token_waves, 1) static __global__
   }
 }
 
+__device__ __forceinline__ float Q8Materialize(float v) {
+  asm volatile("" : "+v"(v));
+  return v;
+}
+
+// mul_mat_vec_q8 for one input over a few long rows (the draft block's
+// 4-row HC inject, K 10240): a wave is a row's whole latency chain, so each
+// lane loads `steps` of its blocks before the first product. The lane's
+// blocks, products and order are the one-row kernel's, spelled out as it
+// compiles them: d0 * sumi, then one fma with d1 into the sum.
+template<int steps>
+__launch_bounds__(32, 1) static __global__
+    void mul_mat_vec_q8_ahead(const void* __restrict__ weights,
+                              const block_q8_1* __restrict__ input,
+                              float* __restrict__ output,
+                              const uint32_t ncols_x) {
+  constexpr int qi = QI8_0;
+  constexpr int vdr = VDR_Q8_0_Q8_1_MMVQ;
+  constexpr int blocks_per_iter = vdr * 32 / qi;
+  const int lane = threadIdx.x;
+  const int row = blockIdx.x;
+  const int blocks_per_row = ncols_x / QK8_0;
+  const block_q8_0* bx =
+      static_cast<const block_q8_0*>(weights) + row * blocks_per_row;
+  const int kqs = vdr * (lane % (qi / vdr));
+  float sum = 0.0f;
+  for (int kb = lane / (qi / vdr); kb < blocks_per_row;
+       kb += steps * blocks_per_iter) {
+    int v[steps][vdr];
+    int u[steps][vdr];
+    half d0[steps];
+    half d1[steps];
+#pragma unroll
+    for (int s = 0; s < steps; ++s) {
+      const block_q8_0* w = bx + kb + s * blocks_per_iter;
+      const block_q8_1* y = input + kb + s * blocks_per_iter;
+#pragma unroll
+      for (int i = 0; i < vdr; ++i) {
+        v[s][i] = get_int_b2(w->qs, kqs + i);
+        u[s][i] = get_int_b4(y->qs, kqs + i);
+      }
+      d0[s] = w->d;
+      d1[s] = __low2half(y->ds);
+    }
+#pragma unroll
+    for (int s = 0; s < steps; ++s) {
+      int sumi = 0;
+#pragma unroll
+      for (int i = 0; i < vdr; ++i)
+        sumi = ggml_hip_dp4a(v[s][i], u[s][i], sumi);
+      const float p =
+          Q8Materialize(__half2float(d0[s]) * static_cast<float>(sumi));
+      sum = Q8Materialize(__builtin_fmaf(p, __half2float(d1[s]), sum));
+    }
+  }
+  sum = warp_reduce_sum<32>(sum);
+  if (lane == 0)
+    output[row] = sum;
+}
+
 // Integer matrix products reuse each Q8 weight across up to 48 inputs.
 // Keep four separate K8 sums per wave: merging them into a K32 integer sum
 // would change the scalar kernel's rounded products, FMA chain and reduction.
@@ -558,6 +618,10 @@ static void launch_q8(const void* weights, const void* gate, const block_q8_1* i
     if (gate) {
         mul_mat_vec_q8<tokens, true><<<rows, 32, 0, stream>>>(
             weights, gate, input, output, k, rows, input_stride);
+    } else if (tokens == 1 && rows <= 64 && k % (32 * 8 * 20) == 0) {
+        // Few rows cannot hide a lane's load latency behind other waves.
+        mul_mat_vec_q8_ahead<20><<<rows, 32, 0, stream>>>(weights, input,
+                                                          output, k);
     } else {
         mul_mat_vec_q8<tokens, false><<<rows, 32, 0, stream>>>(
             weights, nullptr, input, output, k, rows, input_stride);
