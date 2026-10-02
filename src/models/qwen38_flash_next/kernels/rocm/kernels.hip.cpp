@@ -2963,6 +2963,11 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
   // Four 512-block selections plus their incomplete tail. The same LDS
   // stores a mask for arbitrary wider selections used by operator callers.
   constexpr unsigned kListCapacity = 4 * 512 + 4;
+  // A compact entry also carries which of the packed queries selected the
+  // block, so the softmax reads its mask bits from the tile, not global.
+  constexpr unsigned kMaskRows = kPackHeads ? kQueryRows : 1;
+  constexpr unsigned kMemberShift = 28;
+  static_assert(kMaskRows <= 32 - kMemberShift, "membership bits fit");
   __shared__ unsigned union_words[kListCapacity];
   __shared__ unsigned wave_counts[8];
   bool compact = false;
@@ -2974,14 +2979,23 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
     const unsigned word_count = (n_blocks + 31) / 32;
     const unsigned words_per_thread = (word_count + 255) / 256;
     unsigned local_words[8];
+    unsigned row_words[8][kMaskRows];
     unsigned count = 0;
 #pragma unroll
     for (unsigned j = 0; j < 8; ++j) {
       const unsigned w = tid * words_per_thread + j;
       unsigned bits = 0;
+#pragma unroll
+      for (unsigned r = 0; r < kMaskRows; ++r)
+        row_words[j][r] = 0;
       if (j < words_per_thread && w < word_count) {
-        for (unsigned r = 0; r < live_rows; ++r)
-          bits |= mask[size_t(query_start + r) * mask_words + w];
+#pragma unroll
+        for (unsigned r = 0; r < kMaskRows; ++r) {
+          if (r < live_rows) {
+            row_words[j][r] = mask[size_t(query_start + r) * mask_words + w];
+            bits |= row_words[j][r];
+          }
+        }
         if (w * 32 >= tail_block)
           bits = ~0u;
         else if ((w + 1) * 32 > tail_block)
@@ -3017,7 +3031,11 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
       if (compact) {
         while (bits) {
           unsigned bit = __builtin_ctz(bits);
-          union_words[prefix++] = word * 32 + bit;
+          unsigned members = 0;
+#pragma unroll
+          for (unsigned r = 0; r < kMaskRows; ++r)
+            members |= ((row_words[j][r] >> bit) & 1u) << r;
+          union_words[prefix++] = (word * 32 + bit) | (members << kMemberShift);
           bits &= bits - 1;
         }
       } else if (j < words_per_thread && word < word_count) {
@@ -3046,18 +3064,26 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
   struct Tile {
     std::uint32_t block[kBlocksPerTile];
     std::uint32_t count;
+    std::uint32_t members;  // kMaskRows bits per block, compact lists only
   };
   // Gathers the next tile starting the search at block `b`; returns the
   // block to continue from.
   const auto gather_tile = [&](std::uint32_t b, Tile& tile) {
     if (compact) {
       tile.count = min(kBlocksPerTile, selected - min(b, selected));
+      tile.members = 0;
 #pragma unroll
-      for (unsigned i = 0; i < kBlocksPerTile; ++i)
-        tile.block[i] = b + i < selected ? union_words[b + i] : n_blocks;
+      for (unsigned i = 0; i < kBlocksPerTile; ++i) {
+        const unsigned entry = b + i < selected ? union_words[b + i] : 0u;
+        tile.block[i] = b + i < selected
+                            ? entry & ((1u << kMemberShift) - 1u)
+                            : n_blocks;
+        tile.members |= (entry >> kMemberShift) << (i * kMaskRows);
+      }
       return b + tile.count;
     }
     tile.count = 0;
+    tile.members = 0;
 #pragma unroll
     for (std::uint32_t i = 0; i < kBlocksPerTile; ++i) {
       b = next_block(b);
@@ -3216,8 +3242,14 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
           bool valid = live_row && key_position <= absolute_query &&
                        key_position < context_end;
           if (valid && words != nullptr && key_position < tail_start) {
-            const std::uint32_t b = key_position / ratio;
-            valid = ((words[b / 32] >> (b % 32)) & 1u) != 0u;
+            if (compact) {
+              const std::uint32_t slot =
+                  ((col / ratio) * kMaskRows) + (local_query - query_start);
+              valid = ((cur.members >> slot) & 1u) != 0u;
+            } else {
+              const std::uint32_t b = key_position / ratio;
+              valid = ((words[b / 32] >> (b % 32)) & 1u) != 0u;
+            }
           }
           const std::uint32_t tile = ((col / 16) * kRowBlocks) + rb;
           vals[m] = valid ? (s_lds[0][tile][row][col % 16] +
