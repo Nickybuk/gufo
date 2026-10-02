@@ -222,6 +222,56 @@ static __device__ __forceinline__ float warp_reduce_sum(float x) {
     return xor_reduce_sum<width>(x);
 }
 
+// Reduce-scatter levels for n sums: the first levels of the wave butterfly
+// each halve the sums a lane carries.
+constexpr int ScatterLevels(int n) { return n <= 1 ? 0 : n <= 2 ? 1 : n <= 4 ? 2 : 3; }
+
+// One butterfly level that keeps half of `count` sums: the lane on the
+// `offset` side keeps the upper half and sends the lower, its partner the
+// reverse, so each kept sum adds the partner's copy of the same sum.
+template<int offset, int count>
+static __device__ __forceinline__ void scatter_level(float* s, int lane) {
+    const bool upper = (lane & offset) != 0;
+#pragma unroll
+    for (int i = 0; i < count / 2; ++i) {
+        const float keep = upper ? s[count / 2 + i] : s[i];
+        const float send = upper ? s[i] : s[count / 2 + i];
+        s[i] = keep + xor_lane<offset>(send);
+    }
+}
+
+// warp_reduce_sum<32> over n sums at once: the same pairs (16, 8, 4, 2, 1)
+// and operands as the full butterfly, which leaves every lane with identical
+// bits, but lane l only finishes sum l >> (5 - ScatterLevels(n)).
+template<int n>
+static __device__ __forceinline__ float scatter_reduce_sum(const float (&v)[n], int lane) {
+    constexpr int levels = ScatterLevels(n);
+    float s[1 << levels];
+#pragma unroll
+    for (int j = 0; j < (1 << levels); ++j)
+        s[j] = j < n ? v[j] : 0.0f;
+    if constexpr (levels == 3) {
+        scatter_level<16, 8>(s, lane);
+        scatter_level<8, 4>(s, lane);
+        scatter_level<4, 2>(s, lane);
+    } else if constexpr (levels == 2) {
+        scatter_level<16, 4>(s, lane);
+        scatter_level<8, 2>(s, lane);
+        s[0] += xor_lane<4>(s[0]);
+    } else if constexpr (levels == 1) {
+        scatter_level<16, 2>(s, lane);
+        s[0] += xor_lane<8>(s[0]);
+        s[0] += xor_lane<4>(s[0]);
+    } else {
+        s[0] += xor_lane<16>(s[0]);
+        s[0] += xor_lane<8>(s[0]);
+        s[0] += xor_lane<4>(s[0]);
+    }
+    s[0] += xor_lane<2>(s[0]);
+    s[0] += xor_lane<1>(s[0]);
+    return s[0];
+}
+
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ float2 warp_reduce_sum(float2 a) {
 #pragma unroll

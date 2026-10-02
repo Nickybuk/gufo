@@ -5,7 +5,10 @@ namespace qfn_mmq {
 #include "vecdotq.hpp"
 
 // Each wave handles up to eight dense inputs for one weight row on gfx1151.
-template<int ncols_dst, bool has_gate, int token_waves = 1, bool ragged = false>
+// `scatter` reduces the inputs' sums together and stores them from one lane
+// each (same bits as reducing each sum on every lane and storing from lane 0).
+template<int ncols_dst, bool has_gate, int token_waves = 1, bool ragged = false,
+         bool scatter = false>
 __launch_bounds__(32 * token_waves, 1) static __global__
     void mul_mat_vec_q8(const void* __restrict__ weights,
                         const void* __restrict__ gate,
@@ -40,6 +43,22 @@ __launch_bounds__(32 * token_waves, 1) static __global__
                                          row_offset + kbx, kqs);
       }
     }
+  }
+  if constexpr (scatter) {
+    static_assert(token_waves == 1 && !ragged);
+    constexpr int shift = 5 - ScatterLevels(ncols_dst);
+    // Both reductions run on the full wave; only the stores are per lane.
+    float value = scatter_reduce_sum(sum, lane);
+    float gate_value = 0.0f;
+    if constexpr (has_gate)
+      gate_value = scatter_reduce_sum(gate_sum, lane);
+    const int token = lane >> shift;
+    if ((lane & ((1 << shift) - 1)) == 0 && token < ncols_dst) {
+      if constexpr (has_gate)
+        value *= ggml_hip_op_silu_single(gate_value);
+      output[token * nrows_x + row] = value;
+    }
+    return;
   }
 #pragma unroll
   for (int j = 0; j < ncols_dst; ++j) {
@@ -615,13 +634,19 @@ static void launch_moe_grouped(const void* gate, const void* up,
 template <int tokens>
 static void launch_q8(const void* weights, const void* gate, const block_q8_1* input,
                       float* output, int k, int rows, int input_stride, hipStream_t stream) {
-    if (gate) {
+    if (gate && tokens > 1) {
+        mul_mat_vec_q8<tokens, true, 1, false, true><<<rows, 32, 0, stream>>>(
+            weights, gate, input, output, k, rows, input_stride);
+    } else if (gate) {
         mul_mat_vec_q8<tokens, true><<<rows, 32, 0, stream>>>(
             weights, gate, input, output, k, rows, input_stride);
     } else if (tokens == 1 && rows <= 64 && k % (32 * 8 * 20) == 0) {
         // Few rows cannot hide a lane's load latency behind other waves.
         mul_mat_vec_q8_ahead<20><<<rows, 32, 0, stream>>>(weights, input,
                                                           output, k);
+    } else if (tokens > 1) {
+        mul_mat_vec_q8<tokens, false, 1, false, true><<<rows, 32, 0, stream>>>(
+            weights, nullptr, input, output, k, rows, input_stride);
     } else {
         mul_mat_vec_q8<tokens, false><<<rows, 32, 0, stream>>>(
             weights, nullptr, input, output, k, rows, input_stride);
