@@ -564,30 +564,42 @@ __device__ __forceinline__ void QuantizeQ8TiledLane(
   }
 }
 
-/// parts[0] + ... + parts[n - 1] in order from zero, every load issued
-/// before the first add for up to kMaxParts parts.
-__device__ __forceinline__ float SumParts(const float* parts, std::uint32_t n) {
-  constexpr std::uint32_t kMaxParts = 16;
-  float total = Materialize(0.0f);
-  if (n > kMaxParts) {
-    for (std::uint32_t p = 0; p < n; ++p) {
-      total += parts[p];
+/// Up to kMaxParts inject partials held in registers: every load issues
+/// before the first add (indices clamped, so none waits behind a branch),
+/// and Sum adds parts[0] + ... + parts[n - 1] in order from zero.
+struct InjectParts {
+  static constexpr std::uint32_t kMaxParts = 16;
+  const float* parts;
+  std::uint32_t n;
+  float v[kMaxParts];
+
+  __device__ __forceinline__ InjectParts(const float* p, std::uint32_t count)
+      : parts(p), n(count) {
+    if (n - 1 < kMaxParts) {
+#pragma unroll
+      for (std::uint32_t i = 0; i < kMaxParts; ++i) {
+        v[i] = parts[i < n ? i : n - 1];
+      }
+    }
+  }
+
+  __device__ __forceinline__ float Sum() const {
+    float total = Materialize(0.0f);
+    if (n - 1 >= kMaxParts) {
+      for (std::uint32_t i = 0; i < n; ++i) {
+        total += parts[i];
+      }
+      return total;
+    }
+#pragma unroll
+    for (std::uint32_t i = 0; i < kMaxParts; ++i) {
+      if (i < n) {
+        total = Materialize(total + v[i]);
+      }
     }
     return total;
   }
-  float v[kMaxParts];
-#pragma unroll
-  for (std::uint32_t p = 0; p < kMaxParts; ++p) {
-    v[p] = p < n ? parts[p] : 0.0f;
-  }
-#pragma unroll
-  for (std::uint32_t p = 0; p < kMaxParts; ++p) {
-    if (p < n) {
-      total = Materialize(total + v[p]);
-    }
-  }
-  return total;
-}
+};
 
 /// grid (tokens, streams): one block owns one residual stream, so the
 /// grouped norm of the next mixer reduces over exactly its own elements.
@@ -611,22 +623,27 @@ __global__ void HcCombineKernel(float* res, const float* block_out,
   const float* g = gamma + static_cast<std::size_t>(s) * hidden;
   // A row of up to kHeld elements per thread stays in registers between the
   // two passes, every read issued up front (a strided loop of loads behind
-  // stores to `res` would wait out each one), the row before the inject
-  // partials so their loads overlap. Same arithmetic, same order.
+  // stores to `res` would wait out each one): the inject partials first, as
+  // the update needs their sum before any row element, then the row at
+  // clamped indices (a load under `i < hidden` is a branch of its own, and
+  // the compiler waits for it there). Lanes past `hidden` never use theirs.
+  // Same arithmetic, same order.
   constexpr std::uint32_t kHeld = 10;
-  if (hidden <= kHeld * blockDim.x) {
+  if (hidden != 0 && hidden <= kHeld * blockDim.x) {
+    const InjectParts inject_sum(parts, inject_parts);
     float r[kHeld];
     float b[kHeld];
     float gv[kHeld];
 #pragma unroll
     for (std::uint32_t c = 0; c < kHeld; ++c) {
       const std::uint32_t i = threadIdx.x + c * blockDim.x;
-      r[c] = i < hidden ? dst[i] : 0.0f;
-      b[c] = i < hidden ? src[i] : 0.0f;
-      gv[c] = gamma != nullptr && i < hidden ? g[i] : 0.0f;
+      const std::uint32_t k = i < hidden ? i : hidden - 1;
+      r[c] = dst[k];
+      b[c] = src[k];
+      gv[c] = gamma != nullptr ? g[k] : 0.0f;
     }
-    const float w = 2.0f * SigmoidF(SumParts(parts, inject_parts) /
-                                    static_cast<float>(streams));
+    const float w =
+        2.0f * SigmoidF(inject_sum.Sum() / static_cast<float>(streams));
     float ss = 0.0f;
 #pragma unroll
     for (std::uint32_t c = 0; c < kHeld; ++c) {
@@ -658,7 +675,7 @@ __global__ void HcCombineKernel(float* res, const float* block_out,
     }
     return;
   }
-  const float w = 2.0f * SigmoidF(SumParts(parts, inject_parts) /
+  const float w = 2.0f * SigmoidF(InjectParts(parts, inject_parts).Sum() /
                                   static_cast<float>(streams));
   float ss = 0.0f;
   for (std::uint32_t i = threadIdx.x; i < hidden; i += blockDim.x) {
