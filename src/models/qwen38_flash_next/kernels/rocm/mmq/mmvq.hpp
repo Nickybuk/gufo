@@ -25,7 +25,8 @@ void mul_mat_vec_q8_dispatch(const void* weights, const void* gate,
 void mul_mat_vec_moe_dispatch(const void* weights, ggml_type type,
                              const block_q8_1* input, const int32_t* ids, float* output,
                              int k, int rows, int tokens, int experts_used,
-                             int input_stride, hipStream_t stream);
+                             int input_stride, hipStream_t stream,
+                             const int32_t* dst_slots = nullptr);
 // Scratch ints mul_mat_vec_moe_gated needs for 2..MMVQ_MAX_BATCH_SIZE tokens:
 // a group per slot and two anchor lists.
 constexpr int mmvq_moe_group_ints(int tokens, int experts_used) {
