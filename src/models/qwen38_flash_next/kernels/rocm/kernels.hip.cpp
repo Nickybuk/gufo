@@ -564,6 +564,31 @@ __device__ __forceinline__ void QuantizeQ8TiledLane(
   }
 }
 
+/// parts[0] + ... + parts[n - 1] in order from zero, every load issued
+/// before the first add for up to kMaxParts parts.
+__device__ __forceinline__ float SumParts(const float* parts, std::uint32_t n) {
+  constexpr std::uint32_t kMaxParts = 16;
+  float total = Materialize(0.0f);
+  if (n > kMaxParts) {
+    for (std::uint32_t p = 0; p < n; ++p) {
+      total += parts[p];
+    }
+    return total;
+  }
+  float v[kMaxParts];
+#pragma unroll
+  for (std::uint32_t p = 0; p < kMaxParts; ++p) {
+    v[p] = p < n ? parts[p] : 0.0f;
+  }
+#pragma unroll
+  for (std::uint32_t p = 0; p < kMaxParts; ++p) {
+    if (p < n) {
+      total = Materialize(total + v[p]);
+    }
+  }
+  return total;
+}
+
 /// grid (tokens, streams): one block owns one residual stream, so the
 /// grouped norm of the next mixer reduces over exactly its own elements.
 /// `XnT` is float for the reference route and __half for the F16 mixer
@@ -578,19 +603,16 @@ __global__ void HcCombineKernel(float* res, const float* block_out,
   __shared__ float shared[32];
   const std::uint32_t t = blockIdx.x;
   const std::uint32_t s = blockIdx.y;
-  float logit = 0.0f;
-  for (std::uint32_t p = 0; p < inject_parts; ++p) {
-    logit +=
-        inject[(static_cast<std::size_t>(t) * streams + s) * inject_parts + p];
-  }
-  const float w = 2.0f * SigmoidF(logit / static_cast<float>(streams));
+  const float* parts =
+      inject + (static_cast<std::size_t>(t) * streams + s) * inject_parts;
   const std::size_t base = (static_cast<std::size_t>(t) * streams + s) * hidden;
   float* dst = res + base;
   const float* src = block_out + static_cast<std::size_t>(t) * hidden;
   const float* g = gamma + static_cast<std::size_t>(s) * hidden;
   // A row of up to kHeld elements per thread stays in registers between the
   // two passes, every read issued up front (a strided loop of loads behind
-  // stores to `res` would wait out each one). Same arithmetic, same order.
+  // stores to `res` would wait out each one), the row before the inject
+  // partials so their loads overlap. Same arithmetic, same order.
   constexpr std::uint32_t kHeld = 10;
   if (hidden <= kHeld * blockDim.x) {
     float r[kHeld];
@@ -603,6 +625,8 @@ __global__ void HcCombineKernel(float* res, const float* block_out,
       b[c] = i < hidden ? src[i] : 0.0f;
       gv[c] = gamma != nullptr && i < hidden ? g[i] : 0.0f;
     }
+    const float w = 2.0f * SigmoidF(SumParts(parts, inject_parts) /
+                                    static_cast<float>(streams));
     float ss = 0.0f;
 #pragma unroll
     for (std::uint32_t c = 0; c < kHeld; ++c) {
@@ -634,6 +658,8 @@ __global__ void HcCombineKernel(float* res, const float* block_out,
     }
     return;
   }
+  const float w = 2.0f * SigmoidF(SumParts(parts, inject_parts) /
+                                  static_cast<float>(streams));
   float ss = 0.0f;
   for (std::uint32_t i = threadIdx.x; i < hidden; i += blockDim.x) {
     const float v = dst[i] + src[i] * w;
@@ -2840,7 +2866,9 @@ __global__ void RouterTopKKernel(const float* logits, std::uint32_t stride,
   }
 }
 
-/// grid (tokens, dim chunks of kThreads).
+/// grid (tokens, dim chunks of kThreads). Up to kMaxSlots slots, every read
+/// is issued before the first product (a slot loop waits out each load in
+/// turn), and the sum still runs slot by slot from zero.
 __global__ void MoeEpilogueKernel(const float* expert_out, const float* weights,
                                   const float* shared_out, const float* gate,
                                   std::uint32_t gate_stride, float* out,
@@ -2848,6 +2876,29 @@ __global__ void MoeEpilogueKernel(const float* expert_out, const float* weights,
   const std::uint32_t t = blockIdx.x;
   const std::uint32_t i = blockIdx.y * blockDim.x + threadIdx.x;
   if (i >= dim) {
+    return;
+  }
+  constexpr std::uint32_t kMaxSlots = 16;
+  if (k <= kMaxSlots) {
+    const float* rows = expert_out + static_cast<std::size_t>(t) * k * dim + i;
+    float w[kMaxSlots];
+    float v[kMaxSlots];
+#pragma unroll
+    for (std::uint32_t s = 0; s < kMaxSlots; ++s) {
+      w[s] = s < k ? weights[t * k + s] : 0.0f;
+      v[s] = s < k ? rows[static_cast<std::size_t>(s) * dim] : 0.0f;
+    }
+    const std::size_t idx = static_cast<std::size_t>(t) * dim + i;
+    const float sh = shared_out[idx];
+    const float g = gate[static_cast<std::size_t>(t) * gate_stride];
+    float acc = Materialize(0.0f);
+#pragma unroll
+    for (std::uint32_t s = 0; s < kMaxSlots; ++s) {
+      if (s < k) {
+        acc = Materialize(acc + w[s] * v[s]);
+      }
+    }
+    out[idx] = acc + SigmoidF(g) * sh;
     return;
   }
   float acc = 0.0f;
