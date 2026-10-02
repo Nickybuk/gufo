@@ -5151,7 +5151,7 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
   }
 
   if constexpr (kAttention) {
-    static_assert(BM == 256 && BN == 128 && BK == 2 && WM == 8 && WN == 1);
+    static_assert(BM == 256 && BN == 128 && WM == 8 && WN == 1);
     static_assert(!kHcMix && !kSsmConv);
     constexpr unsigned stride = 36, dim = 256, width = 6144, kvwidth = 512;
     float* scratch = reinterpret_cast<float*>(s_lds);
@@ -5454,9 +5454,11 @@ bool AttentionF16Gemm(const void* weights, const __half* input,
                                          values,  position, theta, eps,  rope};
   // One 256-row tile per query, gate, key or value head (52). Four row
   // tiles per token tile in launch order share each activation tile's read
-  // (8.8 to 7.9 ms at 4,096 tokens).
+  // (8.8 to 7.9 ms at 4,096 tokens). One K block per LDS stage halves the
+  // stage to 24 KB, so three blocks share a WGP instead of two (7.8 to
+  // 7.3 ms); the K order is unchanged.
   hipLaunchKernelGGL(
-      (DenseF16GEMMKernel<256, 128, 2, 8, 1, 4, false, false, true>),
+      (DenseF16GEMMKernel<256, 128, 1, 8, 1, 4, false, false, true>),
       dim3((n_tokens + 127) / 128, 52), dim3(kThreads), 0, stream, weights,
       input, nullptr, n_tokens, 13312, 2560, nullptr, nullptr, nullptr, nullptr,
       nullptr, output);
