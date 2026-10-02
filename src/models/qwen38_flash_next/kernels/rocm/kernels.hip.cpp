@@ -2564,10 +2564,32 @@ __global__ void AttentionKernel(const float* q, const __half* k_cache,
   const __half* k_head = k_cache + kvh * d;
   const __half* v_head = v_cache + kvh * d;
 
-  // Loads eight contiguous halves as floats: one 16-byte load per lane, so a
-  // wave reads a whole 256-wide row at once.
-  const auto load8 = [&](const __half* row, float* out8) {
-    const uint4 packed = *reinterpret_cast<const uint4*>(row + (lane * 8));
+  // Rows are read eight contiguous halves per lane, one 16-byte load, so a
+  // wave reads a whole 256-wide row at once. A wave issues the rows of
+  // `kBatch` consecutive keys of its 32 before using any, so their loads
+  // overlap instead of each waiting out its own latency. Empty lanes read
+  // the last key's row and are never used; a batch with no key at all is
+  // skipped (returns false).
+  constexpr std::uint32_t kBatch = 8;
+  const auto load_batch = [&](const __half* head, std::uint32_t base,
+                              uint4* rows) {
+    bool any = false;
+#pragma unroll
+    for (std::uint32_t b = 0; b < kBatch; ++b) {
+      any = any || keys[base + b] < n_kv;
+    }
+    if (!any) {
+      return false;
+    }
+#pragma unroll
+    for (std::uint32_t b = 0; b < kBatch; ++b) {
+      const std::uint32_t j = min(keys[base + b], n_kv - 1);
+      rows[b] = *reinterpret_cast<const uint4*>(
+          head + (static_cast<std::size_t>(j) * kv_stride) + (lane * 8));
+    }
+    return true;
+  };
+  const auto unpack8 = [](const uint4& packed, float* out8) {
     const auto* h2 = reinterpret_cast<const __half2*>(&packed);
 #pragma unroll
     for (std::uint32_t j = 0; j < 4; ++j) {
@@ -2587,21 +2609,30 @@ __global__ void AttentionKernel(const float* q, const __half* k_cache,
       qv[j] = qs[(lane * 8) + j];
     }
     float s_mine = -INFINITY;
-    for (std::uint32_t kk = 0; kk < 32; ++kk) {
-      const std::uint32_t slot = (wave * 32) + kk;
-      const std::uint32_t j = keys[slot];
-      float dot = 0.0f;
-      if (j < n_kv) {
-        float kv[8];
-        load8(k_head + (static_cast<std::size_t>(j) * kv_stride), kv);
-#pragma unroll
-        for (std::uint32_t x = 0; x < 8; ++x) {
-          dot += qv[x] * kv[x];
-        }
+    for (std::uint32_t k0 = 0; k0 < 32; k0 += kBatch) {
+      uint4 rows[kBatch];
+      if (!load_batch(k_head, (wave * 32) + k0, rows)) {
+        continue;
       }
-      dot = WaveSum(dot);
-      if (lane == kk) {
-        s_mine = j < n_kv ? dot * scale : -INFINITY;
+#pragma unroll
+      for (std::uint32_t b = 0; b < kBatch; ++b) {
+        const std::uint32_t j = keys[(wave * 32) + k0 + b];
+        float kv[8];
+        unpack8(rows[b], kv);
+        // The lane's eight products in the order fast-math has always
+        // summed them, spelled out so the scores stay bitwise.
+        float dot = qv[7] * kv[7];
+        dot = fmaf(qv[3], kv[3], dot);
+        dot = fmaf(qv[5], kv[5], dot);
+        dot = fmaf(qv[1], kv[1], dot);
+        dot = fmaf(qv[6], kv[6], dot);
+        dot = fmaf(qv[2], kv[2], dot);
+        dot = fmaf(qv[4], kv[4], dot);
+        dot = fmaf(qv[0], kv[0], dot);
+        dot = WaveSum(dot);
+        if (lane == k0 + b) {
+          s_mine = j < n_kv ? dot * scale : -INFINITY;
+        }
       }
     }
     const float tile_max = BlockMax(s_mine, shared);
@@ -2617,15 +2648,21 @@ __global__ void AttentionKernel(const float* q, const __half* k_cache,
     }
     m = m_new;
     __syncthreads();
-    for (std::uint32_t kk = 0; kk < 32; ++kk) {
-      const std::uint32_t slot = (wave * 32) + kk;
-      const float w = p[slot];
-      if (w != 0.0f) {
-        float vv[8];
-        load8(v_head + (static_cast<std::size_t>(keys[slot]) * kv_stride), vv);
+    for (std::uint32_t k0 = 0; k0 < 32; k0 += kBatch) {
+      uint4 rows[kBatch];
+      if (!load_batch(v_head, (wave * 32) + k0, rows)) {
+        continue;
+      }
 #pragma unroll
-        for (std::uint32_t x = 0; x < 8; ++x) {
-          acc[x] += w * vv[x];
+      for (std::uint32_t b = 0; b < kBatch; ++b) {
+        const float w = p[(wave * 32) + k0 + b];
+        if (w != 0.0f) {
+          float vv[8];
+          unpack8(rows[b], vv);
+#pragma unroll
+          for (std::uint32_t x = 0; x < 8; ++x) {
+            acc[x] = fmaf(w, vv[x], acc[x]);
+          }
         }
       }
     }
@@ -2656,11 +2693,14 @@ __global__ void AttentionKernel(const float* q, const __half* k_cache,
       // Thread i owns blocks w0 + 4i .. +3 of the window: flag the selected
       // ones and compact their indices with a block-wide exclusive scan,
       // appending after the carried-over blocks.
+      // The four blocks share one mask word: read it once.
       std::uint32_t flags = 0;
       std::uint32_t count = 0;
+      const std::uint32_t b0 = w0 + (i * 4);
+      const std::uint32_t word = b0 < n_complete ? words[b0 / 32] : 0u;
       for (std::uint32_t k = 0; k < 4; ++k) {
-        const std::uint32_t b = w0 + (i * 4) + k;
-        const bool set = b < n_complete && ((words[b / 32] >> (b % 32)) & 1u);
+        const std::uint32_t b = b0 + k;
+        const bool set = b < n_complete && ((word >> (b % 32)) & 1u);
         flags |= (set ? 1u : 0u) << k;
         count += set ? 1u : 0u;
       }
