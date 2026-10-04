@@ -45,9 +45,9 @@ template<typename T>
 T* Upload(const std::vector<T>& host) {
   void* p = nullptr;
   CheckHip(hipMalloc(&p, host.size() * sizeof(T)), "hipMalloc");
-  CheckHip(hipMemcpy(p, host.data(), host.size() * sizeof(T),
-                     hipMemcpyHostToDevice),
-           "hipMemcpy");
+  CheckHip(
+      hipMemcpy(p, host.data(), host.size() * sizeof(T), hipMemcpyHostToDevice),
+      "hipMemcpy");
   return static_cast<T*>(p);
 }
 
@@ -76,9 +76,9 @@ std::vector<std::uint8_t> Q8Weights(std::size_t rows, std::size_t k,
 std::vector<__half> Activations(std::size_t count, std::uint32_t seed) {
   std::vector<__half> x(count);
   for (auto& v : x)
-    v = __float2half(static_cast<float>(static_cast<int>(Next(&seed) % 2001) -
-                                        1000) /
-                     1000.0F);
+    v = __float2half(
+        static_cast<float>(static_cast<int>(Next(&seed) % 2001) - 1000) /
+        1000.0F);
   return x;
 }
 
@@ -136,7 +136,8 @@ int main(int argc, char** argv) try {
             throw std::runtime_error("DenseF16Gemm");
         },
         reps);
-    report("out", ms, 2.0 * tokens * m * k, Hash(y, tokens * m * sizeof(float)));
+    report("out", ms, 2.0 * tokens * m * k,
+           Hash(y, tokens * m * sizeof(float)));
     CheckHip(hipFree(w), "hipFree");
     CheckHip(hipFree(x), "hipFree");
     CheckHip(hipFree(y), "hipFree");
@@ -226,7 +227,8 @@ int main(int argc, char** argv) try {
     auto* q_gamma = Upload(gamma);
     auto* k_gamma = Upload(gamma);
     auto* position = Upload(std::vector<std::uint32_t>{0U});
-    const std::size_t q_bytes = std::size_t{tokens} * heads * 256 * sizeof(float);
+    const std::size_t q_bytes =
+        std::size_t{tokens} * heads * 256 * sizeof(float);
     const std::size_t kv_bytes =
         std::size_t{tokens} * kv_heads * 256 * sizeof(__half);
     auto* query = static_cast<float*>(Zeros(q_bytes));
@@ -236,8 +238,8 @@ int main(int argc, char** argv) try {
     const double ms = MedianMs(
         [&] {
           if (!q::AttentionF16Gemm(w, x, q_gamma, k_gamma, query, gate, keys,
-                                   values, tokens, position,
-                                   1.0e7F, 1.0e-6F, nullptr))
+                                   values, tokens, position, 1.0e7F, 1.0e-6F,
+                                   nullptr))
             throw std::runtime_error("AttentionF16Gemm");
         },
         reps);
@@ -265,10 +267,10 @@ int main(int argc, char** argv) try {
     const auto bf16 = [](std::size_t count, std::uint32_t seed, float scale) {
       std::vector<std::uint16_t> v(count);
       for (auto& e : v) {
-        const float f = scale *
-                        static_cast<float>(static_cast<int>(Next(&seed) % 2001) -
-                                           1000) /
-                        1000.0F;
+        const float f =
+            scale *
+            static_cast<float>(static_cast<int>(Next(&seed) % 2001) - 1000) /
+            1000.0F;
         std::uint32_t bits = 0;
         std::memcpy(&bits, &f, 4);
         e = static_cast<std::uint16_t>((bits + 0x7FFFU + ((bits >> 16) & 1U)) >>
@@ -326,9 +328,10 @@ int main(int argc, char** argv) try {
             std::printf("%s n %d DIFF\n", name, n);
         }
       }
-      std::printf("%s n 1..%d: own kernel at %d, bitwise differ at %d; "
-                  "library only at:%s\n",
-                  name, t, routed, differ, library_only.c_str());
+      std::printf(
+          "%s n 1..%d: own kernel at %d, bitwise differ at %d; "
+          "library only at:%s\n",
+          name, t, routed, differ, library_only.c_str());
       for (void* p : {static_cast<void*>(w), static_cast<void*>(x),
                       static_cast<void*>(y_lib), static_cast<void*>(y_own)})
         CheckHip(hipFree(p), "hipFree");

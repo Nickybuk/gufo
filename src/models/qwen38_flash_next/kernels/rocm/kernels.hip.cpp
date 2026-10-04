@@ -3083,9 +3083,8 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
 #pragma unroll
       for (unsigned i = 0; i < kBlocksPerTile; ++i) {
         const unsigned entry = b + i < selected ? union_words[b + i] : 0u;
-        tile.block[i] = b + i < selected
-                            ? entry & ((1u << kMemberShift) - 1u)
-                            : n_blocks;
+        tile.block[i] =
+            b + i < selected ? entry & ((1u << kMemberShift) - 1u) : n_blocks;
         tile.members |= (entry >> kMemberShift) << (i * kMaskRows);
       }
       return b + tile.count;
@@ -5542,11 +5541,11 @@ bool DenseBf16Gemm(const void* w, const void* x, float* out, std::size_t batch,
   if (m == 0 || batch == 0 || k == 0 || k % 32 != 0)
     return false;
   // Four blocks, one per K rotation class, cover each 512 tokens.
-  hipLaunchKernelGGL(
-      (DenseF16GEMMKernel<64, 128, 2, 2, 4, 1, false, false, false, false,
-                          true>),
-      dim3(((batch + 511) / 512) * 4, (m + 63) / 64), dim3(kThreads), 0,
-      stream, w, static_cast<const __half*>(x), out, batch, m, k);
+  hipLaunchKernelGGL((DenseF16GEMMKernel<64, 128, 2, 2, 4, 1, false, false,
+                                         false, false, true>),
+                     dim3(((batch + 511) / 512) * 4, (m + 63) / 64),
+                     dim3(kThreads), 0, stream, w,
+                     static_cast<const __half*>(x), out, batch, m, k);
   return true;
 }
 

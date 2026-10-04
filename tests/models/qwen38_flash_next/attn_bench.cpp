@@ -47,14 +47,13 @@ template<typename T>
 T* Upload(const std::vector<T>& host) {
   void* p = nullptr;
   CheckHip(hipMalloc(&p, host.size() * sizeof(T)), "hipMalloc");
-  CheckHip(hipMemcpy(p, host.data(), host.size() * sizeof(T),
-                     hipMemcpyHostToDevice),
-           "hipMemcpy");
+  CheckHip(
+      hipMemcpy(p, host.data(), host.size() * sizeof(T), hipMemcpyHostToDevice),
+      "hipMemcpy");
   return static_cast<T*>(p);
 }
 
-std::vector<float> Values(std::size_t count, std::uint32_t seed,
-                          float scale) {
+std::vector<float> Values(std::size_t count, std::uint32_t seed, float scale) {
   std::vector<float> host(count);
   for (auto& v : host)
     v = scale * (static_cast<float>(Next(&seed) % 2001) / 1000.0F - 1.0F);
@@ -96,10 +95,10 @@ int main(int argc, char** argv) try {
     {
       std::uint32_t s = 0xBADC0FFEU;
       for (std::size_t i = 0; i < kv_count; ++i) {
-        kh[i] = __float2half(static_cast<float>(Next(&s) % 2001) / 1000.0F -
-                             1.0F);
-        vh[i] = __float2half(static_cast<float>(Next(&s) % 2001) / 1000.0F -
-                             1.0F);
+        kh[i] =
+            __float2half(static_cast<float>(Next(&s) % 2001) / 1000.0F - 1.0F);
+        vh[i] =
+            __float2half(static_cast<float>(Next(&s) % 2001) / 1000.0F - 1.0F);
       }
     }
     __half* d_k = Upload(kh);
@@ -146,8 +145,7 @@ int main(int argc, char** argv) try {
       run();
       CheckHip(hipEventRecord(stop, nullptr), "hipEventRecord");
       CheckHip(hipEventSynchronize(stop), "hipEventSynchronize");
-      CheckHip(hipEventElapsedTime(&ms[i], start, stop),
-               "hipEventElapsedTime");
+      CheckHip(hipEventElapsedTime(&ms[i], start, stop), "hipEventElapsedTime");
     }
     std::sort(ms.begin(), ms.end());
     std::printf("start %6u tokens %u %s  %8.3f ms  hash %016llx\n", start_pos,

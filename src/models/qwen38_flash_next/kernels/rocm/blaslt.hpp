@@ -43,8 +43,7 @@ private:
   struct Plan;
   std::unique_ptr<Plan> MakePlan(hipDataType type, int m, int n, int k,
                                  std::string* error_msg) const;
-  Plan* FindPlan(hipDataType type, int m, int n, int k,
-                 std::string* error_msg);
+  Plan* FindPlan(hipDataType type, int m, int n, int k, std::string* error_msg);
   bool Run(Plan& plan, const void* weights, const void* input, float* out,
            std::string* error_msg);
 
