@@ -410,7 +410,7 @@ static int moe_vector_projection(int weight_type, const void* W,
           ? (n_tokens > MMVQ_MAX_BATCH_SIZE
                  ? sizeof(int32_t) +
                        size_t(n_tokens) * n_expert_used * sizeof(MoeBatchGroup)
-                 : size_t(n_tokens) * n_expert_used * (n_tokens + 1) *
+                 : size_t(mmvq_moe_group_ints(n_tokens, n_expert_used)) *
                        sizeof(int32_t))
           : 0;
   // A caller-quantized input (the same rows quantize_row_q8_1 writes) only
