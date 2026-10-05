@@ -840,7 +840,7 @@ void Session::Reset() {
 Executor::~Executor() {
   // Readers write pinned staging memory; drain them before freeing it,
   // including when a forward failed before reaching PLE.
-  if (ple_pending_) {
+  if (ple_pending_ || prefetch_.pending) {
     (void)ngram_->WaitRead();
   }
   (void)hipFree(batch_logits_);
@@ -1812,6 +1812,16 @@ bool Executor::PleFetch(Session& session, std::span<const std::int32_t> tokens,
   if (ple_pending_ && !WaitPle(error_msg)) {
     return false;
   }
+  if ((prefetch_.pending || prefetch_.ready) && !speculative &&
+      session.ngram_ == prefetch_.before &&
+      std::ranges::equal(tokens, prefetch_.tokens)) {
+    // These are this batch's rows: WaitPle collects them.
+    session.ngram_ = prefetch_.after;
+    prefetch_.claimed = true;
+    ple_pending_ = true;
+    return true;
+  }
+  FinishPrefetch();
   const Config& c = config();
   const auto n = static_cast<std::uint32_t>(tokens.size());
   // Only proper prefixes need snapshots; the full batch keeps its live state.
@@ -1839,12 +1849,56 @@ bool Executor::PleFetch(Session& session, std::span<const std::int32_t> tokens,
 }
 
 bool Executor::WaitPle(std::string* error_msg) const {
-  const bool ok = ple_pending_ && ngram_->WaitRead();
+  bool ok = ple_pending_;
+  if (ok && prefetch_.claimed) {
+    FinishPrefetch();
+    ok = prefetch_.ready;
+    if (ok) {
+      std::copy_n(prefetch_.rows.data(),
+                  prefetch_.tokens.size() * config().PleEmbeddingDim(),
+                  host_emb_);
+    }
+    prefetch_.ready = false;
+    prefetch_.claimed = false;
+  } else if (ok) {
+    ok = ngram_->WaitRead();
+  }
   ple_pending_ = false;
   if (!ok) {
     AssignError(error_msg, "n-gram table read failed");
   }
   return ok;
+}
+
+void Executor::PrefetchPle(const Session& session,
+                           std::span<const std::int32_t> next) const {
+  const Config& c = config();
+  if (ple_pending_ || prefetch_.pending || next.empty() ||
+      next.size() > options_.max_batch) {
+    return;
+  }
+  // Hashed from the history after this batch, which PleFetch already
+  // advanced; the session keeps it until the next batch claims the rows.
+  prefetch_.ready = false;
+  prefetch_.before = session.ngram_;
+  prefetch_.after = session.ngram_;
+  const std::span<std::uint32_t> rows(host_rows_.data(),
+                                      next.size() * c.ple_heads);
+  HashNgramRows(c, prefetch_.after, next, rows);
+  prefetch_.tokens.assign(next.begin(), next.end());
+  const std::size_t count = next.size() * c.PleEmbeddingDim();
+  if (prefetch_.rows.size() < count) {
+    prefetch_.rows.resize(count);
+  }
+  prefetch_.pending =
+      ngram_->StartRead(rows, std::span<float>(prefetch_.rows.data(), count));
+}
+
+void Executor::FinishPrefetch() const {
+  if (prefetch_.pending) {
+    prefetch_.ready = ngram_->WaitRead();
+    prefetch_.pending = false;
+  }
 }
 
 bool Executor::Ple(const DeviceLayer& l, Session& session, std::uint32_t n,
@@ -1859,6 +1913,10 @@ bool Executor::Ple(const DeviceLayer& l, Session& session, std::uint32_t n,
                              hipMemcpyHostToDevice, stream_),
               "n-gram upload", error_msg))) {
     return false;
+  }
+  if (!embeddings_ready && !prefetch_next_.empty()) {
+    PrefetchPle(session, prefetch_next_);
+    prefetch_next_ = {};
   }
   const std::uint32_t hc_dim = c.HcDim();
   Q8Input emb;
@@ -2453,8 +2511,16 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
 
 bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
                        std::uint32_t n_logits, float* logits, ForwardMode mode,
-                       std::string* error_msg,
-                       PrefillCheckpoint* checkpoint) const {
+                       std::string* error_msg, PrefillCheckpoint* checkpoint,
+                       std::span<const std::int32_t> next) const {
+  // Only this call's PLE layer may start the prefetch of `next`.
+  struct NextHint {
+    std::span<const std::int32_t>& hint;
+    ~NextHint() { hint = {}; }
+  } next_hint{prefetch_next_};
+  if (mode == ForwardMode::kPrefill) {
+    prefetch_next_ = next;
+  }
   const bool speculative = mode == ForwardMode::kVerify;
   PrefillPhase phase(mode == ForwardMode::kPrefill);
   selected_logits_ = nullptr;

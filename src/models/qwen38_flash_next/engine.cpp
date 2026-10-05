@@ -577,7 +577,7 @@ bool Session::DraftCatchUpBatch(std::span<const AdvanceRequest> requests,
 bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
                    bool prefill, std::uint32_t boundary,
                    std::unique_ptr<SessionSnapshot>* checkpoint,
-                   double* capture_ms) {
+                   double* capture_ms, std::span<const std::int32_t> after) {
   rocm::Executor& exec = *model_->executor_;
   for (std::size_t off = 0; off < tokens.size();) {
     const auto remaining = tokens.size() - off;
@@ -601,8 +601,14 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
       if (!capture)
         return false;
     }
+    // The chunk this loop, or the following Sync, takes next.
+    const auto rest = off + n < tokens.size() ? tokens.subspan(off + n) : after;
+    const auto next = rest.first(std::min<std::size_t>(
+        rest.size() <= exec.max_batch() ? exec.max_batch()
+                                        : model_->PrefillCapacity(),
+        rest.size()));
     if (!exec.Forward(*session_, chunk, 1, logits_.data(), mode, error_msg,
-                      capture.get())) {
+                      capture.get(), next)) {
       return false;
     }
     const auto kept = capture && capture->tokens < n ? n - capture->tokens : n;
@@ -629,9 +635,9 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
   return true;
 }
 
-bool Session::Sync(std::span<const std::int32_t> prompt,
-                   std::string* error_msg) {
-  return SyncImpl(prompt, error_msg, 0, nullptr);
+bool Session::Sync(std::span<const std::int32_t> prompt, std::string* error_msg,
+                   std::span<const std::int32_t> next) {
+  return SyncImpl(prompt, error_msg, 0, nullptr, nullptr, next);
 }
 
 bool Session::SyncThrough(std::span<const std::int32_t> prompt,
@@ -653,7 +659,7 @@ bool Session::SyncThrough(std::span<const std::int32_t> prompt,
 bool Session::SyncImpl(std::span<const std::int32_t> prompt,
                        std::string* error_msg, std::uint32_t boundary,
                        std::unique_ptr<SessionSnapshot>* checkpoint,
-                       double* capture_ms) {
+                       double* capture_ms, std::span<const std::int32_t> next) {
   if (prompt.empty()) {
     AssignError(error_msg, "prompt is empty");
     return false;
@@ -680,7 +686,7 @@ bool Session::SyncImpl(std::span<const std::int32_t> prompt,
   }
   valid_ = false;
   const bool ok = Feed(prompt.subspan(common), error_msg, true, boundary,
-                       checkpoint, capture_ms);
+                       checkpoint, capture_ms, next);
   valid_ = ok;
   return ok;
 }
