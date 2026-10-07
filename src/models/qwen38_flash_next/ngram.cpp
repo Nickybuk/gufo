@@ -15,10 +15,9 @@ namespace gufo::models::qwen38_flash_next {
 namespace {
 
 constexpr std::size_t kPage = 4096;
-// Readers block in pread, so the pool, not the core count, sets the queue
-// depth of the n-gram gather. 4096-token prefill chunks double each gather;
-// see kPrefillChunkTokens in engine.cpp.
-constexpr std::size_t kWorkers = 128;
+// Next-chunk prefetch hides large gathers behind the current transformer
+// pass. More readers increased CPU work without improving served prefill.
+constexpr std::size_t kWorkers = 32;
 constexpr std::size_t kReadBatch = 8;
 constexpr std::size_t kBatchJobs = 1024;
 constexpr std::size_t kCacheBytes = 128 * 1024 * 1024;

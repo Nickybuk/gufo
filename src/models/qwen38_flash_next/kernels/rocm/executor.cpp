@@ -928,33 +928,63 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   s.xn_half = Alloc<__half>(a, T * hc_dim, error_msg);
   s.xn_q8t = Alloc<std::uint8_t>(a, Q8TiledBytes(T, hc_dim), error_msg);
   s.lo = f32(T * c.hc_low_rank);
-  s.hc_gate = f32(T * hc_dim);
   s.mixed = f32(T * hidden);
   s.inject = f32(T * c.hc_count * HcInjectParts(hidden));
   s.block_out = f32(T * hidden);
-  // Stacked and separate SSM projections are mutually exclusive. MTP's
-  // projected embedding is consumed before attention and reuses this space.
-  s.qkvz = f32(T * std::max<std::size_t>({c.SsmConvChannels() + c.SsmValueDim(),
-                                          c.ple_layer >= 0 ? hc_dim : 0}));
-  s.qkv = s.qkvz;
-  s.z = s.qkvz != nullptr ? s.qkvz + T * c.SsmConvChannels() : nullptr;
-  s.alpha_beta = f32(T * 2 * c.ssm_num_v_heads);
-  s.conv_scratch = f32((T + c.ssm_conv_kernel) * c.SsmConvChannels());
-  s.qn = f32(T * c.SsmKeyDim());
-  s.kn = f32(T * c.SsmKeyDim());
-  s.gdn_raw = f32(T * c.SsmValueDim());
-  s.gdn_out = f32(T * c.SsmValueDim());
-  s.qg = f32(T * (2 * c.AttentionQDim() + 2 * c.AttentionKvDim()));
-  s.q = f32(T * c.AttentionQDim());
-  s.attn_gate = f32(T * c.AttentionQDim());
-  s.k = f32(T * c.AttentionKvDim());
-  s.v = f32(T * c.AttentionKvDim());
-  s.iq = f32(T * c.indexer_heads * c.indexer_head_dim);
-  s.ik = f32(T * c.indexer_head_dim);
   const std::uint32_t max_blocks =
       (c.context_length + c.compress_ratio - 1) / c.compress_ratio;
   e->mask_words_ = (max_blocks + 31) / 32;
-  s.mask = Alloc<std::uint32_t>(a, T * e->mask_words_, error_msg);
+  const std::size_t linear_projection = std::max<std::size_t>(
+      c.SsmConvChannels() + c.SsmValueDim(), c.ple_layer >= 0 ? hc_dim : 0);
+  const std::size_t linear_floats =
+      T * (linear_projection + 2 * c.ssm_num_v_heads + 2 * c.SsmKeyDim() +
+           2 * c.SsmValueDim()) +
+      (T + c.ssm_conv_kernel) * c.SsmConvChannels();
+  const std::size_t attention_floats =
+      T * (5 * c.AttentionQDim() + 4 * c.AttentionKvDim() +
+           c.indexer_heads * c.indexer_head_dim + c.indexer_head_dim +
+           e->mask_words_);
+  const std::size_t expert_floats = slots * (2 * c.expert_ff + hidden);
+  // Linear/full attention and routed experts run sequentially on stream_.
+  // Their intermediates die before the next stage, including batched rows,
+  // MTP catch-up and the deferred MoE epilogue consumed by Combine. Keep
+  // stable addresses for graph replay without reserving all three stages.
+  float* const stage =
+      f32(std::max({linear_floats, attention_floats, expert_floats,
+                    T * (linear_projection + hc_dim)}));
+  if (stage == nullptr) {
+    return nullptr;
+  }
+  // Mixer gates die before attention/experts start. PLE also uses this
+  // buffer as its key, so keep it beyond PLE's gated output at stage.
+  s.hc_gate = stage + T * linear_projection;
+  float* cursor = stage;
+  const auto take = [&](std::size_t count) {
+    float* result = cursor;
+    cursor += count;
+    return result;
+  };
+  // Stacked and separate SSM projections are mutually exclusive. MTP's
+  // projected embedding is consumed before attention and reuses this space.
+  s.qkvz = take(T * linear_projection);
+  s.qkv = s.qkvz;
+  s.z = s.qkvz != nullptr ? s.qkvz + T * c.SsmConvChannels() : nullptr;
+  s.alpha_beta = take(T * 2 * c.ssm_num_v_heads);
+  s.conv_scratch = take((T + c.ssm_conv_kernel) * c.SsmConvChannels());
+  s.qn = take(T * c.SsmKeyDim());
+  s.kn = take(T * c.SsmKeyDim());
+  s.gdn_raw = take(T * c.SsmValueDim());
+  s.gdn_out = take(T * c.SsmValueDim());
+  cursor = stage;
+  s.qg = take(T * (2 * c.AttentionQDim() + 2 * c.AttentionKvDim()));
+  s.q = take(T * c.AttentionQDim());
+  s.attn_gate = take(T * c.AttentionQDim());
+  s.k = take(T * c.AttentionKvDim());
+  s.v = take(T * c.AttentionKvDim());
+  s.iq = take(T * c.indexer_heads * c.indexer_head_dim);
+  s.ik = take(T * c.indexer_head_dim);
+  s.mask = reinterpret_cast<std::uint32_t*>(take(T * e->mask_words_));
+  s.ctx = take(T * c.AttentionQDim());
   // Keep score/selection traffic near the device cache size. Captured
   // verification still needs all its rows at the maximum context.
   const std::size_t score_stride = std::size_t{e->mask_words_} * 32;
@@ -962,7 +992,6 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
       std::max(kVecBatch * score_stride,
                std::min(std::size_t{5 * 1024 * 1024}, 512 * score_stride));
   s.scores = f32(e->select_score_floats_);
-  s.ctx = f32(T * c.AttentionQDim());
   s.attn_partials = f32(static_cast<std::size_t>(kVecBatch) * c.num_heads *
                         kAttnSplits * (c.head_dim + 2));
   if (c.ple_layer >= 0) {
@@ -999,9 +1028,10 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
         Alloc<std::int32_t>(a, 3 * RoutedTileCapacity(slots, c), error_msg);
   }
   s.weights = f32(slots);
-  s.gate_e = f32(slots * c.expert_ff);
-  s.up_e = f32(slots * c.expert_ff);
-  s.down_e = f32(slots * hidden);
+  cursor = stage;
+  s.gate_e = take(slots * c.expert_ff);
+  s.up_e = take(slots * c.expert_ff);
+  s.down_e = take(slots * hidden);
   s.shexp_gate = f32(T * c.shared_expert_ff);
   s.shexp_up = f32(T * c.shared_expert_ff);
   s.shexp_out = f32(T * hidden);

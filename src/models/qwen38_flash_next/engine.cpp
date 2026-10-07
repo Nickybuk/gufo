@@ -21,10 +21,9 @@ namespace gufo::models::qwen38_flash_next {
 namespace {
 
 // gfx1151, served repository prompts: 4096-token chunks prefill 24K-102K
-// tokens 6-11% faster than 2048 (pp4096 +5% at d0, +6% at d32K) for about
-// 1.3 GiB more peak memory; prompts under 8K tokens are unchanged. Each
-// chunk's n-gram gather doubles, so this relies on the 128 readers and the
-// next-chunk prefetch. Prefill logits do not depend on the chunk size
+// tokens 6-11% faster than 2048 (pp4096 +5% at d0, +6% at d32K). Each
+// chunk's n-gram gather doubles; next-chunk prefetch overlaps that read.
+// Prefill logits do not depend on the chunk size
 // (pre-budget queries always take the dense attention tiles).
 constexpr std::uint32_t kPrefillChunkTokens = 4096;
 // A prompt ending this close past a chunk finishes in that chunk: a separate
