@@ -24,8 +24,18 @@ MTP=/path/to/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf
 
 The loader discovers the remaining shards. Omit the speculative options for AR;
 AR sessions allocate no predictor state even if a shared model has MTP loaded.
-Adaptive MTP is default, with `--draft-tokens` capping 1–7 proposals. Sampled
-requests use deterministic acceptance/cost control for seeded replay; all-greedy
+Adaptive MTP is default, with `--draft-tokens` capping 1–7 proposals. The MTP
+drafts over the first 98,304 token IDs, the special tokens and up to 1,024 other
+tokens the request has already used. Drafting uses the full vocabulary when the
+anchor or two of the last 32 committed tokens fall outside these. A greedy
+request not in a jointly planned batch drafts until the product of the drafts'
+top-1 confidences falls below 0.6, and one token per full-vocabulary cycle while
+it keeps fewer than 0.95 drafts per cycle. Such a sampled request stops before a
+draft whose learned acceptance at that confidence does not pay for it, priced at
+the configured `--sessions`; with more than one session, greedy requests stop the
+same way instead of on the 0.6 product. Greedy
+output is unchanged; every policy reads only committed history, so seeded
+sampling replays. Jointly planned batches keep their shared width; all-greedy
 C>1 batches may use measured cycle costs. Each request keeps private caches,
 rollback and RNG. See [MTP qualification](QUALITY.md).
 

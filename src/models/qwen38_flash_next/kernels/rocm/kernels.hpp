@@ -562,6 +562,22 @@ void GatherArgmaxCandidates(const float* logits, const std::uint32_t* ids,
                             ArgmaxCandidate* out, std::uint32_t rows,
                             std::uint32_t vocab, hipStream_t stream);
 
+/// Draft logits of empty table slots (table[i] < 0) become -infinity.
+void MaskDraftLogits(float* logits, const std::int32_t* table, std::uint32_t n,
+                     hipStream_t stream);
+
+/// Full-vocabulary logits to the small-head layout, in place: row
+/// prefix + i becomes logits[table[i]], or -infinity for an empty slot
+/// (table[i] < 0). n is at most 1024 (one block).
+void GatherDraftLogits(float* logits, const std::int32_t* table,
+                       std::uint32_t prefix, std::uint32_t n,
+                       hipStream_t stream);
+
+/// Draft head rows back to token IDs: ids[i] >= prefix (a table row) becomes
+/// table[ids[i] - prefix]; prefix rows are already token IDs.
+void RemapDraftIds(std::uint32_t* ids, std::uint32_t n, std::uint32_t prefix,
+                   const std::int32_t* table, hipStream_t stream);
+
 /// Number of IDs in each of the two selection buffers.
 std::uint32_t MtpCandidateWorkspaceSize(std::uint32_t vocab);
 

@@ -7287,6 +7287,54 @@ void PenalizedArgmax(const float* logits, GreedyPenaltyRows penalties,
                                                            vocab);
 }
 
+__global__ void MaskDraftLogitsKernel(float* logits, const std::int32_t* table,
+                                      std::uint32_t n) {
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n && table[i] < 0)
+    logits[i] = -INFINITY;
+}
+
+void MaskDraftLogits(float* logits, const std::int32_t* table, std::uint32_t n,
+                     hipStream_t stream) {
+  hipLaunchKernelGGL(MaskDraftLogitsKernel, dim3(Blocks(n)), dim3(kThreads), 0,
+                     stream, logits, table, n);
+}
+
+__global__ void GatherDraftLogitsKernel(float* logits,
+                                        const std::int32_t* table,
+                                        std::uint32_t prefix, std::uint32_t n) {
+  // One block: every read finishes before any write, so the table rows can
+  // overwrite the logits they are gathered from.
+  const std::uint32_t i = threadIdx.x;
+  float value = -INFINITY;
+  if (i < n && table[i] >= 0)
+    value = logits[table[i]];
+  __syncthreads();
+  if (i < n)
+    logits[prefix + i] = value;
+}
+
+void GatherDraftLogits(float* logits, const std::int32_t* table,
+                       std::uint32_t prefix, std::uint32_t n,
+                       hipStream_t stream) {
+  hipLaunchKernelGGL(GatherDraftLogitsKernel, dim3(1), dim3(n), 0, stream,
+                     logits, table, prefix, n);
+}
+
+__global__ void RemapDraftIdsKernel(std::uint32_t* ids, std::uint32_t n,
+                                    std::uint32_t prefix,
+                                    const std::int32_t* table) {
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n && ids[i] >= prefix)
+    ids[i] = static_cast<std::uint32_t>(table[ids[i] - prefix]);
+}
+
+void RemapDraftIds(std::uint32_t* ids, std::uint32_t n, std::uint32_t prefix,
+                   const std::int32_t* table, hipStream_t stream) {
+  hipLaunchKernelGGL(RemapDraftIdsKernel, dim3(Blocks(n)), dim3(kThreads), 0,
+                     stream, ids, n, prefix, table);
+}
+
 void GatherArgmaxCandidates(const float* logits, const std::uint32_t* ids,
                             ArgmaxCandidate* out, std::uint32_t rows,
                             std::uint32_t vocab, hipStream_t stream) {

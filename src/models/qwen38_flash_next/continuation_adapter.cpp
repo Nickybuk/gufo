@@ -421,6 +421,7 @@ void ContinuationAdapter::BeginRestore(
   state.restoring = true;
   state.session->valid_ = false;
   state.session->tokens_.resize(target);
+  state.session->ForgetDraftVocab();
   state.session->logits_.resize(model_->VocabSize());
 }
 

@@ -88,6 +88,11 @@ public:
       state_.retry_tokens = 16;
   }
 
+  /// C1 milliseconds a drafted token costs less than the cost table says,
+  /// for cycles that draft through the small head (draft_vocab.hpp). Set
+  /// from the request's committed tokens before Choose; Observe uses it too.
+  void SetDraftSaving(float ms) noexcept { draft_saving_ = std::max(ms, 0.0F); }
+
   void ObserveArToken() noexcept {
     if (state_.retry_tokens != 0)
       --state_.retry_tokens;
@@ -145,7 +150,7 @@ private:
       const float probability = Probability(depth);
       survival *= probability;
       expected_tokens += survival;
-      const float cost = costs[length] / costs[0];
+      const float cost = (costs[length] - draft_saving_ * length) / costs[0];
       const float score = expected_tokens / cost;
       if (score > best_score) {
         best_score = score;
@@ -157,7 +162,154 @@ private:
 
   std::uint32_t limit_;
   std::uint32_t concurrency_;
+  float draft_saving_{0.0F};
   MtpLengthState state_{};
+};
+
+/// Top-1 mass of a proposal within its candidate set.
+[[nodiscard]] inline float MtpDraftConfidence(
+    std::span<const float> logits) noexcept {
+  if (logits.empty())
+    return 0.0F;
+  const float largest = *std::ranges::max_element(logits);
+  float sum = 0.0F;
+  for (const float logit : logits)
+    sum += std::exp(logit - largest);
+  return 1.0F / sum;
+}
+
+/// A greedy cycle that drafts toward the limit keeps drafting while the
+/// product of its drafts' confidences stays at or above this. The first draft
+/// is always kept.
+inline constexpr float kMtpDraftChainConfidence = 0.6F;
+
+// A greedy request that keeps less than one full-head draft per cycle is
+// drafting past what the head predicts for it: the chain gate trusts the
+// head's confidence, which is optimistic for some scripts (Thai, Japanese).
+// Such a request drafts one token per full-head cycle until its average
+// recovers. Small-head cycles count towards the average but are never capped.
+class MtpLowAcceptance {
+public:
+  void Reset() noexcept {
+    average_ = 1.2F;
+    cycles_ = 0;
+  }
+
+  void Observe(std::size_t accepted) noexcept {
+    average_ = 0.98F * average_ + 0.02F * static_cast<float>(accepted);
+    if (cycles_ < kWarmup)
+      ++cycles_;
+  }
+
+  /// Whether a full-head cycle should draft only its first token.
+  [[nodiscard]] bool Low() const noexcept {
+    return cycles_ >= kWarmup && average_ < 0.95F;
+  }
+
+private:
+  static constexpr std::uint32_t kWarmup = 15;
+  float average_{1.2F};
+  std::uint32_t cycles_{0};
+};
+
+// Sampled drafting, and greedy drafting on a server with more than one
+// session, stops on calibrated confidence. Each draft is kept while
+// its chance of being reached and accepted, per millisecond it adds to the
+// cycle, beats the request's own committed tokens per millisecond.
+// Acceptance is learned per confidence bucket from the committed
+// accept/reject prefix only; time comes from the cost table, never request
+// timings. The first draft is always kept.
+class MtpConfidenceStop {
+public:
+  explicit MtpConfidenceStop(std::uint32_t limit)
+      : limit_(std::clamp(limit, 1U, kMaxMtpDraftTokens)) {
+    Reset();
+  }
+
+  [[nodiscard]] std::uint32_t limit() const noexcept { return limit_; }
+
+  void Reset() noexcept {
+    // The head is about 10 % overconfident on gfx1151 traces in every
+    // measured language; start each bucket there, worth two observations.
+    for (std::size_t b = 0; b < kBuckets; ++b) {
+      const float low = b == 0 ? 0.0F : kEdges[b - 1];
+      const float high = b == kEdges.size() ? 1.0F : kEdges[b];
+      successes_[b] = 2.0F * 0.9F * (low + high) / 2.0F;
+      failures_[b] = 2.0F - successes_[b];
+    }
+    tokens_ = 0.0F;
+    milliseconds_ = 0.0F;
+    drafts_ = 0;
+  }
+
+  /// Costs are those of the server's configured sessions, like the length
+  /// controller's: fixed per server, so a request decides the same alone
+  /// or in an unplanned batch.
+  void Begin(std::uint32_t context, float draft_saving,
+             std::uint32_t concurrency = 1) noexcept {
+    costs_ = MtpCycleCosts(context, concurrency);
+    draft_saving_ = draft_saving;
+    survival_ = 1.0F;
+    drafts_ = 0;
+    if (milliseconds_ == 0.0F) {
+      tokens_ = 2.5F;
+      milliseconds_ = Cost(0) + 2.5F * (Cost(1) - Cost(0));
+    }
+  }
+
+  /// Whether the next draft, proposed with this confidence, is worth
+  /// verifying. A speculative cycle always carries its first draft.
+  [[nodiscard]] bool Keep(float confidence) noexcept {
+    if (drafts_ >= limit_)
+      return false;
+    const auto bucket = Bucket(confidence);
+    survival_ *= successes_[bucket] / (successes_[bucket] + failures_[bucket]);
+    const float marginal = std::max(Cost(drafts_ + 1) - Cost(drafts_), 0.1F);
+    if (drafts_ != 0 && survival_ * milliseconds_ < tokens_ * marginal)
+      return false;
+    buckets_[drafts_++] = bucket;
+    return true;
+  }
+
+  /// Only drafts up to the first rejection are observations. `accepted` is
+  /// the committed prefix; a later rejection is the one failure, and anything
+  /// past it was not verified.
+  void Observe(std::size_t accepted, std::size_t drafted) noexcept {
+    drafted = std::min<std::size_t>(drafted, drafts_);
+    accepted = std::min(accepted, drafted);
+    for (std::size_t depth = 0; depth < drafted && depth <= accepted; ++depth) {
+      const auto bucket = buckets_[depth];
+      const bool ok = depth < accepted;
+      successes_[bucket] = 0.95F * successes_[bucket] + (ok ? 1.0F : 0.0F);
+      failures_[bucket] = 0.95F * failures_[bucket] + (ok ? 0.0F : 1.0F);
+    }
+    tokens_ = 0.97F * tokens_ + static_cast<float>(1 + accepted);
+    milliseconds_ = 0.97F * milliseconds_ + Cost(drafted);
+  }
+
+private:
+  static constexpr std::array<float, 8> kEdges{0.3F, 0.5F,  0.7F,  0.8F,
+                                               0.9F, 0.95F, 0.98F, 0.995F};
+  static constexpr std::size_t kBuckets = kEdges.size() + 1;
+
+  [[nodiscard]] static std::size_t Bucket(float confidence) noexcept {
+    return static_cast<std::size_t>(
+        std::ranges::upper_bound(kEdges, confidence) - kEdges.begin());
+  }
+  [[nodiscard]] float Cost(std::size_t drafts) const noexcept {
+    return costs_[drafts] - draft_saving_ * static_cast<float>(drafts);
+  }
+
+  std::uint32_t limit_;
+  std::array<float, kBuckets> successes_{};
+  std::array<float, kBuckets> failures_{};
+  std::array<std::size_t, kMaxMtpDraftTokens> buckets_{};
+  std::array<float, 8> costs_{};
+  float draft_saving_{0.0F};
+  float survival_{1.0F};
+  float tokens_{0.0F};
+  float milliseconds_{0.0F};
+  std::uint32_t drafts_{0};
 };
 
 // Runtime costs belong to a physical batch, not an individual sequence.

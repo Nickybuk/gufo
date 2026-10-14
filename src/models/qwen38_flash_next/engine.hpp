@@ -16,6 +16,7 @@
 #include "src/models/qwen/vision/encoder.hpp"
 #include "src/models/qwen/vision/prompt.hpp"
 #include "src/models/qwen38_flash_next/config.hpp"
+#include "src/models/qwen38_flash_next/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/mtp_policy.hpp"
 
 namespace gufo::core {
@@ -114,6 +115,12 @@ private:
   std::unique_ptr<rocm::Executor> executor_;
   std::shared_ptr<qwen::vision::Encoder> vision_;
   MtpBatchController batch_policy_;
+  /// MTP drafts may use the small head (draft_vocab.hpp).
+  bool draft_subset_{false};
+  /// Special tokens at the start of every session's draft table.
+  std::uint32_t draft_specials_{0};
+  /// Prefix and special tokens: always in the small head.
+  [[nodiscard]] bool InDraftSubset(std::int32_t token) const;
 
   friend class Session;
   friend class ContinuationAdapter;
@@ -205,6 +212,8 @@ public:
     std::uint64_t cycles{0};
     std::uint64_t drafted{0};
     std::uint64_t accepted{0};
+    /// Cycles whose draft scored the small head (draft_vocab.hpp).
+    std::uint64_t small_head_cycles{0};
   };
   [[nodiscard]] const SpeculativeStats& Statistics() const noexcept {
     return stats_;
@@ -264,9 +273,13 @@ private:
                            std::string* error_msg);
   /// Trunk rows the draft block may still read: [hidden_base_, size).
   [[nodiscard]] std::uint32_t KeptHiddenRows() const noexcept;
+  /// A proposal returns its candidates, its greedy token, or both
+  /// (`token_with_candidates`, when a greedy draft stops on confidence).
   bool DraftCatchUp(std::int32_t next_token, bool propose,
                     std::string* error_msg,
-                    MtpCandidateLogits* candidates = nullptr);
+                    MtpCandidateLogits* candidates = nullptr,
+                    bool draft_subset = false,
+                    bool token_with_candidates = false);
   bool DraftReplay(std::int32_t next_token, std::vector<std::int32_t>* replay,
                    std::int32_t* hidden_row, std::string* error_msg) const;
   static bool DraftCatchUpBatch(std::span<const AdvanceRequest> requests,
@@ -283,6 +296,10 @@ private:
                      std::string* error_msg, bool defer_head = false,
                      std::optional<std::uint32_t> batch_drafts = {});
   static void AppendDraft(PendingDecode& pending);
+  /// Folds the latest proposal's confidence into a gated chain; true stops it.
+  static bool StopChain(PendingDecode& pending);
+  /// True when the next sampled draft is not worth verifying.
+  bool StopCalibrated(PendingDecode& pending);
   bool FinishDecode(const DecodeRequest& request, const PendingDecode& pending,
                     std::string* error_msg);
 
@@ -294,12 +311,22 @@ private:
   std::vector<float> verify_logits_;
   std::uint32_t hidden_base_{0};  ///< first position whose hidden row is kept
   MtpLengthController draft_length_;
+  MtpConfidenceStop draft_stop_;
+  MtpLowAcceptance low_acceptance_;
   SpeculativeStats stats_;
   std::shared_ptr<const qwen::vision::Prompt> image_prompt_;
   [[nodiscard]] std::span<const std::uint8_t> ImageIdentity(
       std::size_t token_count) const;
   bool valid_{true};
   ContinuationHooks* continuation_hooks_{nullptr};
+  /// This request's draft vocabulary; the device table follows it.
+  MtpDraftVocab draft_vocab_;
+  bool draft_vocab_stale_{false};
+  std::vector<std::int32_t> draft_added_;
+  /// After the token history is replaced: the table restarts from it.
+  void ForgetDraftVocab() noexcept { draft_vocab_stale_ = true; }
+  /// Brings the draft table up to the committed tokens.
+  bool SyncDraftVocab(std::string* error_msg);
   [[nodiscard]] bool MtpEnabled() const noexcept;
 };
 
