@@ -1449,7 +1449,13 @@ std::size_t Executor::SessionBytes(
          (mode == core::SessionMode::kSpeculative
               ? kv + index +
                     std::size_t{options_.max_speculative + 1} * c.HcDim() *
-                        sizeof(float)
+                        sizeof(float) +
+                    (model_->draft_output().empty()
+                         ? 0
+                         : std::size_t{kMtpDraftExtraRows} *
+                                   (model_->output_row_bytes() +
+                                    sizeof(std::int32_t)) +
+                               4096)
               : 0);
 }
 

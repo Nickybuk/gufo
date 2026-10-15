@@ -11,6 +11,8 @@
 #include <vector>
 
 #include "src/cache/slot.hpp"
+#include "src/models/qwen/chat_template.hpp"
+#include "tests/models/qwen38_flash_next/mtp_replay.hpp"
 
 namespace qfn = gufo::models::qwen38_flash_next;
 namespace cache = gufo::cache;
@@ -787,6 +789,44 @@ void CheckImages(const std::shared_ptr<qfn::Model>& model, bool mtp) {
   }
   std::cout << (mtp ? "MTP" : "AR") << ",image_restore,PASS\n";
 }
+void CheckLearnedDraftPolicy(const std::shared_ptr<qfn::Model>& model) {
+  namespace qt = gufo::tokenization;
+  gufo::hip::TransferPool streams(2);
+  qfn::ContinuationAdapter adapter(model, gufo::core::SessionMode::kSpeculative,
+                                   4096, {'p', 'o', 'l', 'i', 'c', 'y'});
+  Guard source_guard, destination_guard;
+  auto source = adapter.CreateSlot(source_guard);
+  auto destination = adapter.CreateSlot(destination_guard);
+  auto& live = adapter.GetSession(*source);
+  auto& restored = adapter.GetSession(*destination);
+  const std::array messages{
+      qt::ChatMessage{qt::ChatRole::kUser,
+                      "Write a Python LRU cache implementation with get, "
+                      "put, eviction and tests. Explain the edge cases."}};
+  std::string error;
+  const auto encoded = qt::QwenChatTemplate::RenderAndTokenize(
+      model->tokenizer(), messages, {.enable_thinking = false}, &error);
+  Require(encoded.has_value(), error);
+  const std::vector<std::int32_t> prompt(encoded->begin(), encoded->end());
+  Require(live.Sync(prompt, &error) && restored.Sync(prompt, &error), error);
+  sampling::SamplerState sampler(
+      {.temperature = 0.8F, .top_k = 20, .top_p = 0.95F, .seed = 73},
+      std::vector<sampling::TokenId>(prompt.begin(), prompt.end()));
+  auto stale_sampler = sampler;
+  (void)gufo::test::DecodeMtpReplay(restored, stale_sampler, 32);
+  (void)gufo::test::DecodeMtpReplay(live, sampler, 128);
+  const auto checkpoint = Capture(adapter, *source, streams);
+  Load(adapter, *destination, checkpoint, streams);
+  Require(adapter.Validate(*destination, checkpoint.positions),
+          "learned MTP policy checkpoint rejected");
+  SameLogits(live, restored);
+  auto replay_sampler = sampler;
+  Require(gufo::test::DecodeMtpReplay(live, sampler, 64) ==
+              gufo::test::DecodeMtpReplay(restored, replay_sampler, 64),
+          "component restore lost learned MTP acceptance history");
+  SameLogits(live, restored);
+  std::cout << "MTP,learned_draft_policy,PASS\n";
+}
 }  // namespace
 int main(int argc, char** argv) {
   const bool guard_only =
@@ -795,12 +835,15 @@ int main(int argc, char** argv) {
       argc == 6 && std::string_view(argv[5]) == "--image-only";
   const bool in_pass_only =
       argc == 6 && std::string_view(argv[5]) == "--in-pass-only";
-  if ((argc != 5 && !guard_only && !image_only && !in_pass_only) ||
+  const bool policy_only =
+      argc == 6 && std::string_view(argv[5]) == "--policy-only";
+  if ((argc != 5 && !guard_only && !image_only && !in_pass_only &&
+       !policy_only) ||
       std::string_view(argv[1]) != "--model" ||
       std::string_view(argv[3]) != "--mtp-model") {
-    std::cerr
-        << "Usage: continuation_adapter_test --model FIRST.gguf "
-           "--mtp-model MTP.gguf [--guard-only|--image-only|--in-pass-only]\n";
+    std::cerr << "Usage: continuation_adapter_test --model FIRST.gguf "
+                 "--mtp-model MTP.gguf "
+                 "[--guard-only|--image-only|--in-pass-only|--policy-only]\n";
     return 77;
   }
   try {
@@ -808,6 +851,10 @@ int main(int argc, char** argv) {
     auto model = qfn::Model::Load(
         argv[2], {.max_context = 16384, .mtp_model_path = argv[4]}, &error);
     Require(bool(model), error);
+    if (policy_only) {
+      CheckLearnedDraftPolicy(model);
+      return 0;
+    }
     const auto pattern = model->Tokenize(
         "The quick brown fox jumps over the lazy dog. Strix Halo executes this "
         "deterministic benchmark sequence. ");
@@ -815,6 +862,19 @@ int main(int argc, char** argv) {
     std::vector<std::int32_t> prompt(10000);
     for (std::size_t i = 0; i < prompt.size(); ++i)
       prompt[i] = pattern[i % pattern.size()];
+    // The repeated prefix can accept every draft. End the
+    // sampled boundary with real code generation to exercise rejection and
+    // residual replay as well as the long recurrent/KV state.
+    namespace qt = gufo::tokenization;
+    const std::array messages{
+        qt::ChatMessage{qt::ChatRole::kUser,
+                        "Write a Python LRU cache implementation with get, "
+                        "put, eviction and tests. Explain the edge cases."}};
+    const auto sampled_tail = qt::QwenChatTemplate::RenderAndTokenize(
+        model->tokenizer(), messages, {.enable_thinking = false}, &error);
+    Require(sampled_tail && sampled_tail->size() < 8203, error);
+    std::copy(sampled_tail->begin(), sampled_tail->end(),
+              prompt.begin() + 8203 - sampled_tail->size());
     if (!image_only && !in_pass_only) {
       CheckTransferAndGuardLifetime(model, false, prompt);
       CheckTransferAndGuardLifetime(model, true, prompt);
@@ -830,6 +890,7 @@ int main(int argc, char** argv) {
     if (!image_only) {
       Check(model, false, prompt);
       Check(model, true, prompt);
+      CheckLearnedDraftPolicy(model);
     }
     CheckImages(model, false);
     CheckImages(model, true);

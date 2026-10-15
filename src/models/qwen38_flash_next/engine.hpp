@@ -220,7 +220,7 @@ public:
   }
 
   /// Compatibility version; bump on payload or inference arithmetic changes.
-  static constexpr std::uint32_t kSnapshotPayloadVersion = 16;
+  static constexpr std::uint32_t kSnapshotPayloadVersion = 17;
   /// Bytes a snapshot of the current context occupies.
   [[nodiscard]] std::uint64_t SnapshotBytes() const;
   [[nodiscard]] std::uint64_t PrefillCheckpointBytes(
@@ -273,13 +273,10 @@ private:
                            std::string* error_msg);
   /// Trunk rows the draft block may still read: [hidden_base_, size).
   [[nodiscard]] std::uint32_t KeptHiddenRows() const noexcept;
-  /// A proposal returns its candidates, its greedy token, or both
-  /// (`token_with_candidates`, when a greedy draft stops on confidence).
   bool DraftCatchUp(std::int32_t next_token, bool propose,
                     std::string* error_msg,
                     MtpCandidateLogits* candidates = nullptr,
-                    bool draft_subset = false,
-                    bool token_with_candidates = false);
+                    bool draft_subset = false);
   bool DraftReplay(std::int32_t next_token, std::vector<std::int32_t>* replay,
                    std::int32_t* hidden_row, std::string* error_msg) const;
   static bool DraftCatchUpBatch(std::span<const AdvanceRequest> requests,
@@ -296,10 +293,6 @@ private:
                      std::string* error_msg, bool defer_head = false,
                      std::optional<std::uint32_t> batch_drafts = {});
   static void AppendDraft(PendingDecode& pending);
-  /// Folds the latest proposal's confidence into a gated chain; true stops it.
-  static bool StopChain(PendingDecode& pending);
-  /// True when the next sampled draft is not worth verifying.
-  bool StopCalibrated(PendingDecode& pending);
   bool FinishDecode(const DecodeRequest& request, const PendingDecode& pending,
                     std::string* error_msg);
 
@@ -311,8 +304,6 @@ private:
   std::vector<float> verify_logits_;
   std::uint32_t hidden_base_{0};  ///< first position whose hidden row is kept
   MtpLengthController draft_length_;
-  MtpConfidenceStop draft_stop_;
-  MtpLowAcceptance low_acceptance_;
   SpeculativeStats stats_;
   std::shared_ptr<const qwen::vision::Prompt> image_prompt_;
   [[nodiscard]] std::span<const std::uint8_t> ImageIdentity(

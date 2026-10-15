@@ -16,6 +16,7 @@
 #include "src/models/qwen38_flash_next/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
 #include "tests/models/qwen27b/sampling_cases.hpp"
+#include "tests/models/qwen38_flash_next/mtp_replay.hpp"
 
 namespace qfn = gufo::models::qwen38_flash_next;
 namespace sampling = gufo::sampling;
@@ -436,6 +437,84 @@ void CheckMtpCacheReplay(const std::shared_ptr<qfn::Model>& model) {
   }
 }
 
+void CheckDraftPolicySnapshots(const std::shared_ptr<qfn::Model>& model) {
+  if (!model->HasMtp())
+    return;
+  namespace qt = gufo::tokenization;
+  std::string error;
+  struct Case {
+    const char* name;
+    bool thinking;
+    sampling::SamplingConfig config;
+  };
+  // Explicit model presets keep this fixture independent of their resolver.
+  const std::array cases{
+      Case{"greedy", false, {.temperature = 0.0F, .seed = 1}},
+      Case{"thinking-default",
+           true,
+           {.temperature = 1.0F, .top_k = 20, .top_p = 0.95F, .seed = 1}},
+      Case{"nonthinking-default",
+           false,
+           {.temperature = 0.7F,
+            .top_k = 20,
+            .top_p = 0.8F,
+            .seed = 1,
+            .presence_penalty = 1.5F}}};
+  for (const auto& test : cases) {
+    for (const std::string text :
+         {"Write a detailed story about a traveller finding a lost map in "
+          "a library. Include a puzzle and its solution.",
+          "เล่าเรื่องสั้นภาษาไทยเกี่ยวกับแมวสีส้มที่พบแผนที่"
+          "ในห้องสมุดและออกเดินทางตามหาเมืองที่หายไป"}) {
+      const std::array messages{
+          qt::ChatMessage{qt::ChatRole::kSystem,
+                          "Follow the instruction and answer accurately."},
+          qt::ChatMessage{qt::ChatRole::kUser, text}};
+      const auto encoded = qt::QwenChatTemplate::RenderAndTokenize(
+          model->tokenizer(), messages, {.enable_thinking = test.thinking},
+          &error);
+      Require(encoded.has_value(), error);
+      const std::vector<std::int32_t> prompt(encoded->begin(), encoded->end());
+      auto live = model->CreateSession(gufo::core::SessionMode::kSpeculative,
+                                       4096, &error);
+      Require(live && live->Sync(prompt, &error), error);
+      sampling::SamplerState sampler(
+          test.config,
+          std::vector<sampling::TokenId>(prompt.begin(), prompt.end()));
+      // Train the actual controller before saving. Comparing two restored
+      // sessions would miss a restore that resets their learned state equally.
+      const auto trained = gufo::test::DecodeMtpReplay(*live, sampler, 128);
+      Require(trained.drafted > 0, "policy snapshot did not exercise MTP");
+      const auto snapshot = live->SaveSnapshot(&error);
+      Require(snapshot != nullptr, error);
+      std::vector<std::uint8_t> bytes(snapshot->SizeBytes());
+      Require(snapshot->CopyTo(bytes), "serialize learned MTP policy");
+      auto saved_sampler = sampler;
+      const auto expected = gufo::test::DecodeMtpReplay(*live, sampler, 64);
+      const std::vector<float> expected_logits(live->Logits().begin(),
+                                               live->Logits().end());
+      for (const bool serialized : {false, true}) {
+        auto restored = model->CreateSession(
+            gufo::core::SessionMode::kSpeculative, 4096, &error);
+        Require(restored != nullptr, error);
+        Require(serialized ? restored->RestoreSnapshot(bytes, &error)
+                           : restored->RestoreSnapshot(*snapshot, &error),
+                error);
+        auto replay_sampler = saved_sampler;
+        Require(gufo::test::DecodeMtpReplay(*restored, replay_sampler, 64) ==
+                    expected,
+                "restored MTP policy differs from uninterrupted generation");
+        RequireExact(expected_logits, restored->Logits(),
+                     "restored MTP policy changed final target logits");
+      }
+    }
+    std::cout << "policy snapshot preset=" << test.name
+              << " uninterrupted_RAM_serialized_exact=1\n";
+  }
+  std::cout << "learned MTP policy: uninterrupted, RAM and serialized "
+               "greedy and default-sampled continuation are exact\n";
+}
+
 void CheckBatchFailureIsolation(const std::shared_ptr<qfn::Model>& model) {
   std::string error;
   const auto prompt = model->Tokenize("Repeat red, blue, red, blue,");
@@ -806,15 +885,47 @@ void CheckDraftVocabLifecycle(const std::shared_ptr<qfn::Model>& model) {
       const auto actual = decode(*used, b, 4);
       const auto& fs = fresh->Statistics();
       const auto& us = used->Statistics();
-      Require(expected == actual && a.rng_state() == b.rng_state() &&
-                  fs.drafted == us.drafted && fs.accepted == us.accepted &&
-                  fs.small_head_cycles == us.small_head_cycles &&
-                  (pair != &thai_snapshot || fs.small_head_cycles > 0),
-              "restore into a populated draft table differs from a fresh "
-              "session");
+      Require(
+          expected == actual && a.rng_state() == b.rng_state() &&
+              fs.drafted == us.drafted && fs.accepted == us.accepted &&
+              fs.small_head_cycles == us.small_head_cycles &&
+              (sampled || pair != &thai_snapshot || fs.small_head_cycles > 0),
+          "restore into a populated draft table differs from a fresh "
+          "session");
       RequireExact(fresh->Logits(), used->Logits(),
                    "restore into a populated draft table changed logits");
     }
+  }
+
+  // Switching to penalties preserves the target/predictor checkpoint.
+  // Greedy penalties use the full head; sampled proposals may use the table.
+  // Both must replay exactly in populated and fresh sessions.
+  for (const float temperature : {0.0F, 0.8F}) {
+    auto fresh = create();
+    Require(t->RestoreSnapshot(*thai_snapshot, &error) &&
+                fresh->RestoreSnapshot(*thai_snapshot, &error),
+            error);
+    t->ResetDraftPolicy();
+    fresh->ResetDraftPolicy();
+    const sampling::SamplingConfig config{
+        .temperature = temperature, .seed = 73, .presence_penalty = 1.5F};
+    sampling::SamplerState a(config, history(t->Tokens()));
+    auto b = a;
+    const auto expected = gufo::test::DecodeMtpReplay(*fresh, a, 32);
+    const auto actual = gufo::test::DecodeMtpReplay(*t, b, 32);
+    Require(expected == actual && actual.drafted > 0,
+            "penalized replay differs after a populated draft table");
+    if (temperature == 0.0F) {
+      Require(t->Statistics().small_head_cycles == 0 &&
+                  fresh->Statistics().small_head_cycles == 0,
+              "greedy penalties retained the reduced draft head");
+    } else {
+      Require(t->Statistics().small_head_cycles > 0 &&
+                  fresh->Statistics().small_head_cycles > 0,
+              "sampled penalty replay did not exercise the reduced head");
+    }
+    RequireExact(fresh->Logits(), t->Logits(),
+                 "penalized replay changed target logits");
   }
 
   // A mixed batch: two members on the small head (one with rare rows
@@ -841,7 +952,7 @@ void CheckDraftVocabLifecycle(const std::shared_ptr<qfn::Model>& model) {
           error);
     }
     const sampling::SamplingConfig config{
-        .temperature = i == 1 ? 0.0F : 0.3F,
+        .temperature = i < 2 ? 0.0F : 0.3F,
         .seed = static_cast<std::int64_t>(17 + i)};
     serial_samplers.emplace_back(config, history(serial[i]->Tokens()));
     batch_samplers.emplace_back(config, history(batched[i]->Tokens()));
@@ -1261,6 +1372,7 @@ int main(int argc, char** argv) {
     }
     if (cache_only) {
       CheckMtpCacheReplay(model);
+      CheckDraftPolicySnapshots(model);
       return 0;
     }
     CheckSnapshotDuringGraphCapture(model, false);
@@ -1278,8 +1390,10 @@ int main(int argc, char** argv) {
     }
     if (prefill_only)
       return 0;
-    if (!batch_only)
+    if (!batch_only) {
       CheckMtpCacheReplay(model);
+      CheckDraftPolicySnapshots(model);
+    }
     CheckFailureRecovery(model);
     CheckRollbackReuse(model);
     CheckImageSnapshotAttachment(model);

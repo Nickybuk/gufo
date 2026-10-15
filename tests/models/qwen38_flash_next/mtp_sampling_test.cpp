@@ -330,129 +330,12 @@ void CheckVerificationBoundaries() {
   }
 }
 
-void CheckDraftConfidence() {
-  const std::array<float, 4> even{1.0F, 1.0F, 1.0F, 1.0F};
-  const std::array<float, 3> sharp{20.0F, 0.0F, 0.0F};
-  Require(std::abs(qfn::MtpDraftConfidence(even) - 0.25F) < 1e-6F &&
-              qfn::MtpDraftConfidence(sharp) > 0.999F &&
-              qfn::MtpDraftConfidence({}) == 0.0F,
-          "draft confidence is not the top-1 candidate mass");
-  Require(qfn::kMtpDraftChainConfidence > 0.0F &&
-              qfn::kMtpDraftChainConfidence < 1.0F,
-          "the chain confidence gate must be a probability");
-}
-
-void CheckConfidenceStop() {
-  const std::array<float, 4> even{1.0F, 1.0F, 1.0F, 1.0F};
-  const std::array<float, 3> sharp{20.0F, 0.0F, 0.0F};
-  Require(std::abs(qfn::MtpDraftConfidence(even) - 0.25F) < 1e-6F &&
-              qfn::MtpDraftConfidence(sharp) > 0.999F &&
-              qfn::MtpDraftConfidence({}) == 0.0F,
-          "draft confidence is not the top-1 candidate mass");
-
-  qfn::MtpConfidenceStop stop(3);
-  stop.Begin(0, 0.0F);
-  Require(stop.Keep(0.0F), "a speculative cycle dropped its first draft");
-  Require(!stop.Keep(0.1F), "an unlikely later draft was verified");
-  stop.Begin(0, 0.0F);
-  for (unsigned i = 0; i < 3; ++i)
-    Require(stop.Keep(1.0F), "a confident draft was not verified");
-  Require(!stop.Keep(1.0F), "the draft limit was exceeded");
-
-  // Acceptance is learned from committed outcomes, not the raw confidence.
-  for (unsigned i = 0; i < 64; ++i) {
-    stop.Begin(0, 0.0F);
-    Require(stop.Keep(0.1F), "a speculative cycle dropped its first draft");
-    stop.Observe(1, 1);
-  }
-  stop.Begin(0, 0.0F);
-  Require(stop.Keep(0.1F) && stop.Keep(0.1F),
-          "drafts accepted at low confidence were not learned");
-  stop.Reset();
-  stop.Begin(0, 0.0F);
-  Require(stop.Keep(0.1F) && !stop.Keep(0.1F), "reset retained old acceptance");
-
-  // A draft costs a four-session server a batch's time, so it stops sooner.
-  qfn::MtpConfidenceStop one(7), four(7);
-  one.Begin(0, 0.0F, 1);
-  four.Begin(0, 0.0F, 4);
-  Require(one.Keep(0.85F) && one.Keep(0.85F),
-          "a likely draft was dropped at one session");
-  Require(four.Keep(0.85F) && !four.Keep(0.85F),
-          "four sessions verified a draft their batch cost does not repay");
-}
-
-void CheckSampledConfidenceStop() {
-  // Stochastic verification commits a prefix. Repeated rejection of the
-  // second draft retires it; the first draft of a cycle stays. A fully
-  // accepted chain does not learn that rejection. A drafted count past the
-  // proposals actually kept is not an extra failure.
-  qfn::MtpConfidenceStop rejected(7);
-  bool retired = false;
-  for (unsigned i = 0; i < 8; ++i) {
-    rejected.Begin(0, 0.0F);
-    Require(rejected.Keep(0.99F), "a sampled cycle dropped its first draft");
-    if (!rejected.Keep(0.99F)) {
-      retired = true;
-      break;
-    }
-    rejected.Observe(1, 2);
-  }
-  Require(retired, "a rejected sampled draft stayed worth verifying");
-
-  qfn::MtpConfidenceStop accepted(7);
-  for (unsigned i = 0; i < 8; ++i) {
-    accepted.Begin(0, 0.0F);
-    Require(accepted.Keep(0.99F) && accepted.Keep(0.99F),
-            "an accepted sampled draft was not verified");
-    accepted.Observe(2, 2);
-  }
-
-  qfn::MtpConfidenceStop prefix(3), tail(3);
-  prefix.Begin(0, 0.0F);
-  tail.Begin(0, 0.0F);
-  Require(prefix.Keep(0.4F) && tail.Keep(0.4F),
-          "a sampled cycle dropped its first draft");
-  prefix.Observe(0, 1);
-  tail.Observe(0, 5);
-  prefix.Begin(0, 0.0F);
-  tail.Begin(0, 0.0F);
-  Require(prefix.Keep(0.4F) == tail.Keep(0.4F) &&
-              prefix.Keep(0.4F) == tail.Keep(0.4F),
-          "an unverified sampled tail was treated as a failure");
-}
-
-void CheckLowAcceptance() {
-  qfn::MtpLowAcceptance low;
-  low.Reset();
-  for (unsigned i = 0; i < 64; ++i) {
-    Require(!low.Low(), "a request keeping its drafts was capped");
-    low.Observe(2);
-  }
-  for (unsigned i = 0; i < 64; ++i)
-    low.Observe(0);
-  Require(low.Low(), "a request rejecting its drafts was not capped");
-  for (unsigned i = 0; i < 64; ++i)
-    low.Observe(3);
-  Require(!low.Low(), "a recovered request stayed capped");
-  low.Reset();
-  for (unsigned i = 0; i < 14; ++i)
-    low.Observe(0);
-  Require(!low.Low(), "a request was capped before its warmup");
-  low.Observe(0);
-  Require(low.Low(), "a rejecting request was not capped after its warmup");
-}
-
 int main() {
   try {
     CheckVerificationBoundaries();
     CheckLengthController();
     CheckCalibratedCosts();
     CheckBatchProfitability();
-    CheckDraftConfidence();
-    CheckConfidenceStop();
-    CheckSampledConfidenceStop();
-    CheckLowAcceptance();
     CheckCompactProposals();
     CheckSampledOutputFrequencies();
     const std::array<float, 5> logits{0.3F, -0.2F, 1.1F, 0.7F, -1.0F};
@@ -505,9 +388,8 @@ int main() {
       }
     }
     std::cout
-        << "MTP policy replay, greedy prefix/RNG/stops, calibrated sampled "
-           "stop and compact proposal probabilities pass all sampling "
-           "configurations\n";
+        << "MTP policy replay, greedy prefix/RNG/stops and compact proposal "
+           "probabilities pass all sampling configurations\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

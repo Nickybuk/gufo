@@ -1,5 +1,49 @@
 # Qwen3.8 Flash-Next quality
 
+**PR #603's reduced draft vocabulary preserves the target distribution and
+supports the real sampling defaults.** The final review keeps the established
+length controller and AR backoff for every request; it removes the proposed
+confidence/calibrated stopping policy. That policy lost learned state across
+native sampled snapshots and caused repeatable mixed-session and short greedy
+slowdowns. The reduced head is used for C1 sampled requests, including penalties
+and constraints, and eligible greedy requests. Unplanned multi-session requests
+and modified greedy sampling retain the full draft head.
+
+October 15, 2026, against `f6ca085a`, with the same pinned Nix toolchain and
+Unsloth UD-Q4_K_XL/shared Q8_0 MTP weights:
+25,328,640 full-vocabulary target logits after a 28,092-token prompt and
+102 fixed continuation steps are finite and byte-identical. Independent MTP
+formula checks retain their 0.002 relative-RMS limit (worst 0.0007655).
+Native session, snapshot, component-restore, probability-correction and mixed
+head checks pass. New regressions cover actual default sampling, complete
+sampler/RNG replay, used-session table restoration and the subset path with
+penalties. All 12 independent native sampled replay cases pass; the original
+PR failed all 12.
+
+HTTP requests that omit sampling controls exercise both real presets. All
+16 short and two 35K-context default completions pass the timing gate; 17/18
+retain identical output and draft counts. Python/story generation improves
+3–10% at short context and the deep Python cases improve 5–8%. Translation
+defaults are mostly level. The standard C1 AR/MTP captures, including warmups,
+retain exact output/work with no phase flags; greedy MTP gains 5–12% at
+d0/d32K. Focused AR/MTP API, cancellation, long-context and RAM/disk cache
+checks pass correctness. Pi completes four continued coding tasks with
+17 default-sampling requests and 13 tool calls; actual edits and test results
+were inspected.
+
+This is **not a global timing or individual-answer quality pass**. API queue
+flags include simultaneous requests admitted in a different order; the same
+order reversal occurs within main's own captures. Small snapshot/cache-resume
+flags and their focused controls remain in the
+[review evidence](artifacts/draft-vocabulary-review.json). A non-default sampled
+translation repeats about 9% slower with different wording and acceptance;
+its translation is correct, but its extra grammar explanation mislabels a
+declension. Changed proposals can consume RNG differently across builds.
+These numerical, replay and functional checks establish regression evidence
+against main, not upstream unquantized-model accuracy or a statistical
+language-quality result. The published benchmark tables and llama.cpp data
+are unchanged.
+
 **PR #596 repairs the complete functional inventory:** all 48 registered
 Flash-Next suites pass in AR and MTP at `9985ff0a`, including all four deferred
 cache workloads (122 expanded checks, 3,334 requests). The final allocation
@@ -77,8 +121,9 @@ matched-prefill AR/MTP logits and sampled snapshot replay are exact at
 
 Sampled MTP can consume different RNG draws from AR. Seeded replay requires
 the same build, request budget, capacity and sampling configuration; live cost
-timings only steer greedy decoding. Draft sampling uses the full Q8 head's
-top 64 logits; upstream draft-sampler equivalence is not claimed.
+timings only steer greedy decoding. Draft sampling uses the selected Q8 head's
+top 64 logits, with proposals corrected against the full target distribution;
+upstream draft-sampler equivalence is not claimed.
 MTP cache projections now keep the same arithmetic across prompt splits.
 Older Flash-Next disk checkpoints are rejected and rebuilt once.
 

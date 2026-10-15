@@ -20,8 +20,8 @@ namespace gufo::models::qwen38_flash_next {
 /// vocabulary) and every other token the request has already used.
 ///
 /// Only proposals change. The target verifies every drafted token over the
-/// full vocabulary, so greedy output is unchanged, and a sampled proposal is
-/// corrected against the distribution it was drawn from.
+/// full vocabulary, so greedy output is unchanged. Sampled proposals are
+/// corrected against the distribution they were drawn from.
 inline constexpr std::uint32_t kMtpDraftVocab = 98304;
 
 /// Rows of the per-request table: the special tokens, then the request's own
@@ -30,13 +30,6 @@ inline constexpr std::uint32_t kMtpDraftExtraRows = 1024;
 
 /// Committed tokens the head choice looks back over.
 inline constexpr std::size_t kMtpDraftVocabWindow = 32;
-
-/// C1 milliseconds saved per drafted token by the small head: the full head
-/// minus the small one in qwen38_flash_next_gpu_probe --cost-audit 1 on
-/// gfx1151 (Q8_0 MTP head, 2026-10-14), 1.77 ms at depths 0, 4096 and
-/// 32768. The draft length choice uses it for cycles expected to draft
-/// small, where the cost table alone would stop drafting too early.
-inline constexpr float kMtpDraftSmallHeadSavingMs = 1.77F;
 
 /// The request's draft vocabulary and when to use it. A token is a miss when
 /// it is outside the prefix, not special and not yet in the request's table

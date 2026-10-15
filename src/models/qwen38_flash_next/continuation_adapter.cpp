@@ -33,7 +33,7 @@ bool Pool(ContinuationPart part) {
          part == ContinuationPart::kDraftPooledKeys;
 }
 struct Metadata {
-  std::uint32_t version{1};
+  std::uint32_t version{2};
   std::uint32_t target{}, draft{}, blocks{}, draft_blocks{}, hidden_base{};
   std::uint32_t residual_valid{}, image_bytes{};
   NgramHistory ngram;
@@ -785,7 +785,7 @@ bool ContinuationAdapter::Validate(
   auto& session = *state.session;
   auto& native = *session.session_;
   auto policy = session.draft_length_;
-  if (metadata.version != 1 || metadata.hidden_base > metadata.target ||
+  if (metadata.version != 2 || metadata.hidden_base > metadata.target ||
       metadata.target - metadata.hidden_base >
           model_->executor_->max_speculative() ||
       metadata.residual_valid > 1 ||

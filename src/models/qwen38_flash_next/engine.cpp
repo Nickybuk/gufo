@@ -282,7 +282,6 @@ Session::Session(std::shared_ptr<Model> model,
       session_(std::move(session)),
       draft_length_(model_->options_.max_draft_tokens,
                     model_->DecodeConcurrency()),
-      draft_stop_(model_->options_.max_draft_tokens),
       draft_vocab_(kMtpDraftExtraRows - model_->draft_specials_) {
   logits_.resize(model_->VocabSize());
 }
@@ -313,8 +312,6 @@ void Session::ResetDraftPolicy() {
   if (continuation_hooks_)
     continuation_hooks_->BeforeExecution();
   draft_length_.Reset();
-  draft_stop_.Reset();
-  low_acceptance_.Reset();
 }
 
 std::uint32_t Session::Position() const noexcept {
@@ -333,8 +330,6 @@ void Session::Reset() {
   ForgetDraftVocab();
   hidden_base_ = 0;
   draft_length_.Reset();
-  draft_stop_.Reset();
-  low_acceptance_.Reset();
   model_->executor_->MtpRewind(*session_, 0);
   if (continuation_hooks_)
     continuation_hooks_->AfterReset();
@@ -523,9 +518,6 @@ bool Session::RestoreSnapshotImpl(std::span<const std::uint8_t> payload,
   valid_ = false;
   rocm::Executor::SnapshotInfo info;
   const auto remaining = ContextSize() - header.token_count;
-  // Keep rollback scratch for the longer of the two draft heads' choices.
-  if (model_->draft_subset_)
-    restored_policy.SetDraftSaving(kMtpDraftSmallHeadSavingMs);
   const auto next_drafts =
       MtpEnabled() ? restored_policy.Choose(remaining ? remaining - 1 : 0,
                                             header.token_count)
@@ -550,8 +542,6 @@ bool Session::RestoreSnapshotImpl(std::span<const std::uint8_t> payload,
   hidden_base_ = info.position - info.hidden_rows;
   draft_token_ = 0;
   draft_length_ = restored_policy;
-  draft_stop_.Reset();
-  low_acceptance_.Reset();
   stats_ = {};
   valid_ = true;
   return true;
@@ -610,8 +600,7 @@ bool Session::DraftReplay(std::int32_t next_token,
 
 bool Session::DraftCatchUp(std::int32_t next_token, bool propose,
                            std::string* error_msg,
-                           MtpCandidateLogits* candidates, bool draft_subset,
-                           bool token_with_candidates) {
+                           MtpCandidateLogits* candidates, bool draft_subset) {
   std::vector<std::int32_t> replay;
   std::int32_t hidden_row = 0;
   if (!DraftReplay(next_token, &replay, &hidden_row, error_msg))
@@ -621,9 +610,7 @@ bool Session::DraftCatchUp(std::int32_t next_token, bool propose,
   auto& exec = *model_->executor_;
   if (!exec.MtpForward(
           *session_, replay, hidden_row,
-          {.token = propose && (candidates == nullptr || token_with_candidates)
-                        ? &draft_token_
-                        : nullptr,
+          {.token = propose && candidates == nullptr ? &draft_token_ : nullptr,
            .candidates = candidates,
            .draft_subset = draft_subset},
           error_msg)) {
@@ -828,11 +815,7 @@ struct Session::PendingDecode {
   std::uint64_t draft_rng{0};
   MtpCandidateLogits candidates;
   std::int32_t draft{0};
-  bool draft_subset{false};     ///< this cycle drafts through the subset head
-  bool confidence_stop{false};  ///< greedy chain that stops on confidence
-  bool chain_gate{false};       ///< one session: stop on confidence product
-  bool calibrated_stop{false};  ///< drafts stop on calibrated confidence
-  float chain_confidence{1.0F};
+  bool draft_subset{false};  ///< this cycle drafts through the subset head
 };
 
 void Session::AppendDraft(PendingDecode& pending) {
@@ -843,24 +826,6 @@ void Session::AppendDraft(PendingDecode& pending) {
     pending.draft_sampler->Accept(pending.proposals.back().token);
   }
   pending.chain.push_back(pending.draft);
-}
-
-bool Session::StopChain(PendingDecode& pending) {
-  if (!pending.chain_gate)
-    return false;
-  pending.chain_confidence *= MtpDraftConfidence(std::span<const float>(
-      pending.candidates.logits.data(), pending.candidates.size));
-  return pending.chain.size() > 1 &&
-         pending.chain_confidence < kMtpDraftChainConfidence;
-}
-
-bool Session::StopCalibrated(PendingDecode& pending) {
-  if (!pending.calibrated_stop)
-    return false;
-  // Top-1 mass of this proposal. The committed accept/reject is learned
-  // later, from verification, not from this confidence.
-  return !draft_stop_.Keep(MtpDraftConfidence(std::span<const float>(
-      pending.candidates.logits.data(), pending.candidates.size)));
 }
 
 bool Session::PrepareDecode(const DecodeRequest& request,
@@ -885,40 +850,24 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   const std::size_t room = ContextSize() - tokens_.size();
   const std::size_t cap =
       std::min<std::size_t>({max_tokens, room, exec.max_speculative()});
-  // A cycle that will draft small pays less per draft. The anchor is not
-  // sampled yet; the window alone decides, from committed tokens only.
-  if (!batch_drafts && MtpEnabled() && cap > 1) {
-    if (!SyncDraftVocab(error_msg))
-      return false;
-    draft_length_.SetDraftSaving(model_->draft_subset_ && draft_vocab_.Quiet()
-                                     ? kMtpDraftSmallHeadSavingMs
-                                     : 0.0F);
-  }
-  // Greedy output does not depend on the width. A greedy cycle that is not
-  // in a jointly planned batch drafts to the limit and stops on each
-  // proposal's confidence instead, alone or beside sampled requests.
-  const bool confidence_stop =
-      MtpEnabled() && !batch_drafts && !sampler.config().uses_random_sampling();
-  // The chain gate's threshold is a one-session price. A server with more
-  // sessions pays a batch's cost per draft; its greedy cycles stop on
-  // calibrated confidence instead, priced at the configured sessions.
   const auto concurrency = model_->DecodeConcurrency();
-  const bool chain_gate = confidence_stop && concurrency == 1;
-  // Sampled output does depend on the width. Those same cycles draft to the
-  // limit and stop on calibrated confidence, so one request matches itself
-  // in an unplanned batch. Jointly planned batches keep their shared width.
-  const bool calibrated_stop = MtpEnabled() && !batch_drafts &&
-                               (sampler.config().uses_random_sampling() ||
-                                (confidence_stop && !chain_gate));
+  // C1 sampled requests use the subset, including penalties and constraints;
+  // verification corrects their proposals against the full target distribution.
+  // Greedy penalties/constraints retain the full head. Unplanned multi-session
+  // requests also retain it so changed proposal chains cannot delay peers.
+  // Every request keeps the established length controller and AR backoff.
+  const bool unmodified = !sampler.config().uses_random_sampling() &&
+                          !sampler.config().penalties_enabled() &&
+                          !sampler.config().constraint;
+  const bool allow_subset =
+      (unmodified && (concurrency == 1 || batch_drafts.has_value())) ||
+      (concurrency == 1 && sampler.config().uses_random_sampling());
   const std::size_t width =
       MtpEnabled() && cap > 1
           ? 1 + (batch_drafts ? std::min<std::uint32_t>(*batch_drafts, cap - 1)
-                 : (confidence_stop || calibrated_stop)
-                     ? std::min<std::uint32_t>(
-                           model_->options_.max_draft_tokens, cap - 1)
-                     : draft_length_.Choose(
-                           static_cast<std::uint32_t>(cap - 1),
-                           static_cast<std::uint32_t>(tokens_.size())))
+                              : draft_length_.Choose(
+                                    static_cast<std::uint32_t>(cap - 1),
+                                    static_cast<std::uint32_t>(tokens_.size())))
           : cap;
   if (width == 0) {
     result->stop = true;
@@ -943,19 +892,15 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   const bool sampled = sampler.config().uses_random_sampling();
   const bool gpu_greedy = sampler.config().temperature == 0.0F;
   const bool gpu_verification = gpu_greedy;
-  if (!SyncDraftVocab(error_msg))
+  if (allow_subset && !SyncDraftVocab(error_msg))
     return false;
-  pending->confidence_stop = confidence_stop;
-  pending->chain_gate = chain_gate;
-  pending->calibrated_stop = calibrated_stop;
-  pending->draft_subset = model_->draft_subset_ &&
+  pending->draft_subset = allow_subset && model_->draft_subset_ &&
                           draft_vocab_.Fits(anchor, [&](std::int32_t token) {
                             return model_->InDraftSubset(token);
                           });
-  if (!defer_head &&
-      !DraftCatchUp(anchor, true, error_msg,
-                    sampled || confidence_stop ? &pending->candidates : nullptr,
-                    pending->draft_subset, confidence_stop)) {
+  if (!defer_head && !DraftCatchUp(anchor, true, error_msg,
+                                   sampled ? &pending->candidates : nullptr,
+                                   pending->draft_subset)) {
     return false;
   }
   // A cycle-local proposal stream needs no pending RNG state in snapshots.
@@ -966,10 +911,7 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   pending->draft_sampler->Accept(static_cast<sampling::TokenId>(anchor));
   pending->chain = {anchor};
   pending->draft = draft_token_;
-  pending->width =
-      confidence_stop && !pending->draft_subset && low_acceptance_.Low()
-          ? std::min<std::size_t>(width, 2)
-          : width;
+  pending->width = width;
   pending->base = base;
   pending->speculative = true;
   pending->sampled = sampled;
@@ -979,23 +921,14 @@ bool Session::PrepareDecode(const DecodeRequest& request,
       verify_logits_.size() < exec.max_speculative() * model_->VocabSize()) {
     verify_logits_.resize(exec.max_speculative() * model_->VocabSize());
   }
-  if (calibrated_stop)
-    draft_stop_.Begin(base,
-                      pending->draft_subset ? kMtpDraftSmallHeadSavingMs : 0.0F,
-                      concurrency);
   if (!defer_head) {
-    while (pending->chain.size() < pending->width) {
-      if (StopChain(*pending))
-        break;
-      if (StopCalibrated(*pending))
-        break;
+    while (pending->chain.size() < width) {
       AppendDraft(*pending);
-      if (pending->chain.size() < pending->width &&
+      if (pending->chain.size() < width &&
           !exec.MtpForward(
               *session_, std::span<const std::int32_t>(&pending->draft, 1), -1,
               {.token = sampled ? nullptr : &pending->draft,
-               .candidates =
-                   sampled || confidence_stop ? &pending->candidates : nullptr,
+               .candidates = sampled ? &pending->candidates : nullptr,
                .draft_subset = pending->draft_subset},
               error_msg)) {
         return false;
@@ -1118,13 +1051,8 @@ bool Session::FinishDecode(const DecodeRequest& request,
   stats_.accepted += keep - 1;
   stats_.small_head_cycles += pending.draft_subset;
   // A target stop ends the request; it does not classify the remaining
-  // proposals as failed predictions. Sampled calibration sees that same
-  // committed prefix: accepts, then the first stochastic rejection.
+  // proposals as failed predictions.
   draft_length_.Observe(keep - 1, result->stop ? keep - 1 : k - 1, base);
-  if (pending.calibrated_stop)
-    draft_stop_.Observe(keep - 1, result->stop ? keep - 1 : k - 1);
-  if (pending.confidence_stop)
-    low_acceptance_.Observe(keep - 1);
 
   // The next call knows the next sampled anchor. Defer draft catch-up until
   // then, retaining this session's target hidden rows across interleaving.
@@ -1359,12 +1287,10 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
       auto& p = pending[i];
       if (!requests[i].session->session_->Cancelled() && p.speculative &&
           p.chain.size() < p.width) {
-        heads.push_back(
-            {requests[i].session->session_.get(),
-             {.token = p.sampled ? nullptr : &p.draft,
-              .candidates =
-                  p.sampled || p.confidence_stop ? &p.candidates : nullptr,
-              .draft_subset = p.draft_subset}});
+        heads.push_back({requests[i].session->session_.get(),
+                         {.token = p.sampled ? nullptr : &p.draft,
+                          .candidates = p.sampled ? &p.candidates : nullptr,
+                          .draft_subset = p.draft_subset}});
       }
     }
     if (heads.empty())
@@ -1376,14 +1302,6 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
       if (requests[i].session->session_->Cancelled() || !p.speculative ||
           p.chain.size() >= p.width)
         continue;
-      if (StopChain(p)) {
-        p.width = p.chain.size();
-        continue;
-      }
-      if (requests[i].session->StopCalibrated(p)) {
-        p.width = p.chain.size();
-        continue;
-      }
       AppendDraft(p);
       if (p.chain.size() < p.width)
         bodies.push_back({requests[i].session->session_.get(),
